@@ -1,0 +1,1997 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" content="#3b82f6">
+    <meta name="description" content="Historia Clínica General - PWA offline">
+    <link rel="manifest" href="manifest.json">
+    <link rel="icon" href="icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="icon-192.png">
+    <title>Historia Clínica</title>
+    <!-- React & ReactDOM -->
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    
+    <!-- Silenciar warning de Tailwind CDN para mantener la consola limpia en esta arquitectura buildless -->
+    <script>
+        const originalWarn = console.warn;
+        console.warn = function(...args) {
+            if (args[0] && typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com should not be used in production')) {
+                return;
+            }
+            originalWarn.apply(console, args);
+        };
+    </script>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        clinical: {
+                            50: '#eff6ff',
+                            100: '#dbeafe',
+                            200: '#bfdbfe',
+                            300: '#93c5fd',
+                            400: '#60a5fa',
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                            700: '#1d4ed8',
+                            800: '#1e40af',
+                            900: '#1e3a8a',
+                        }
+                    },
+                    fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background-color: #f1f5f9; font-family: 'Inter', system-ui, sans-serif; }
+        .tab-scrollbar::-webkit-scrollbar { display: none; }
+        .tab-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+        input, textarea, select { transition: all 0.2s; font-size: 16px; }
+        input:focus, textarea:focus, select:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.15); }
+        input:read-only { background-color: #f1f5f9; color: #475569; border-color: #e2e8f0; cursor: not-allowed; }
+        @keyframes pulse-rec { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .rec-dot { animation: pulse-rec 1.2s infinite; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-fade-in { animation: fadeIn 0.3s ease-out; }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+        .animate-slide-up { animation: slideUp 0.35s ease-out; }
+        /* Glassmorphism for bottom nav */
+        .glass-nav { background: rgba(255,255,255,0.85); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); }
+        /* Subtle body background pattern */
+        body::before { content: ''; position: fixed; inset: 0; z-index: -1; background: radial-gradient(ellipse at 20% 0%, rgba(59,130,246,0.06) 0%, transparent 60%), radial-gradient(ellipse at 80% 100%, rgba(59,130,246,0.04) 0%, transparent 60%); }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const getNestedValue = (obj, path, defaultValue = '') => {
+            if (!obj) return defaultValue;
+            const keys = path.split('.');
+            let current = obj;
+            for (let key of keys) {
+                if (current === undefined || current === null) return defaultValue;
+                current = current[key];
+            }
+            return current !== undefined ? current : defaultValue;
+        };
+
+        const setNestedValue = (obj, path, value) => {
+            const newData = { ...obj };
+            const keys = path.split('.');
+            let current = newData;
+            for (let i = 0; i < keys.length - 1; i++) {
+                current[keys[i]] = current[keys[i]] ? { ...current[keys[i]] } : {};
+                current = current[keys[i]];
+            }
+            current[keys[keys.length - 1]] = value;
+            return newData;
+        };
+
+        // Construye la entrada resumen de una historia clínica para la lista "Mis Historias".
+        // Se recalcula cada vez que se guarda, a partir de los datos completos del registro.
+        const buildIndexEntry = (id, data) => {
+            const nombre = `${getNestedValue(data, 'id.nombres', '')} ${getNestedValue(data, 'id.apellidos', '')}`.trim();
+            return {
+                id,
+                nombre: nombre || 'Sin nombre',
+                historia_no: getNestedValue(data, 'id.numero', ''),
+                fecha_ingreso: getNestedValue(data, 'id.fecha', ''),
+                tiene_egreso: !!getNestedValue(data, 'egreso.tipo', ''),
+                actualizado: new Date().toISOString(),
+            };
+        };
+
+        // Lista de familiares a los que se puede vincular un antecedente (checklist u "Otros"),
+        // para que la redacción del PDF diga "Madre: Diabetes" en vez de solo "Diabetes".
+        // Los 5 roles base siempre están disponibles; "otros_familiares" son los que el usuario
+        // agrega a mano (ej. "Abuelo materno") en la sección de Composición Familiar.
+        const getFamiliaresDisponibles = (formData) => {
+            const otros = getNestedValue(formData, 'familia_directa.otros_familiares', []);
+            const listaOtros = Array.isArray(otros) ? otros : [];
+            return ['Padre', 'Madre', 'Hermano(s)', 'Cónyuge', 'Hijo(s)', ...listaOtros];
+        };
+
+        // ============================================================
+        // ANTECEDENTES PERSONALES PATOLÓGICOS (checklist Niega/Refiere)
+        // ============================================================
+        const ANTECEDENTES_PATOLOGICOS = [
+            { id: 'alergias', label: 'Alergias (medicamentos / alimentos)', detailPlaceholder: '¿A qué es alérgico?' },
+            { id: 'asma', label: 'Asma' },
+            { id: 'hta', label: 'Hipertensión arterial' },
+            { id: 'diabetes', label: 'Diabetes mellitus' },
+            { id: 'cardiopatias', label: 'Cardiopatías' },
+            { id: 'renal', label: 'Enfermedad renal' },
+            { id: 'hepatica', label: 'Enfermedad hepática' },
+            { id: 'tbc', label: 'Tuberculosis' },
+            { id: 'vih', label: 'VIH' },
+            { id: 'cancer', label: 'Cáncer', detailPlaceholder: 'Tipo y fecha de diagnóstico' },
+            { id: 'convulsiones', label: 'Convulsiones / epilepsia' },
+            { id: 'tiroidea', label: 'Enfermedad tiroidea' },
+            { id: 'niñez', label: 'Enfermedades de la niñez (sarampión, rubéola, varicela, parotiditis, tosferina)' },
+            { id: 'parasitosis', label: 'Parasitosis / amibiasis' },
+            { id: 'fiebre_reumatica', label: 'Fiebre reumática' },
+            { id: 'chagas', label: 'Enfermedad de Chagas' },
+            { id: 'paludismo', label: 'Paludismo / Malaria' },
+            { id: 'tifoidea', label: 'Fiebre tifoidea' },
+            { id: 'its', label: 'Infecciones de transmisión sexual (sífilis, gonorrea, otras)' },
+            { id: 'amigdalitis', label: 'Amigdalitis a repetición' },
+            { id: 'bronquitis', label: 'Bronquitis / episodios de sibilancias' },
+            { id: 'neumonia', label: 'Neumonía' },
+            { id: 'otitis', label: 'Otitis a repetición' },
+            { id: 'pleuresia', label: 'Pleuresía' },
+            { id: 'adenitis', label: 'Adenitis crónica' },
+            { id: 'fiebre_prolongada', label: 'Fiebre prolongada de origen desconocido' },
+        ];
+
+        const ANTECEDENTES_QUIRURGICOS = [
+            { id: 'cirugias', label: 'Cirugías previas', detailPlaceholder: 'Tipo de cirugía y fecha' },
+            { id: 'transfusiones', label: 'Transfusiones sanguíneas', detailPlaceholder: 'Fecha y motivo' },
+            { id: 'traumatismos', label: 'Traumatismos importantes' },
+            { id: 'hospitalizaciones', label: 'Hospitalizaciones previas', detailPlaceholder: 'Motivo y fecha' },
+        ];
+
+        const ANTECEDENTES_FARMACOLOGICOS_CAMPOS = [
+            { id: 'medicamentos_actuales', label: 'Medicamentos de uso actual', type: 'textarea' },
+            { id: 'alergias_medicamentosas', label: 'Alergias medicamentosas conocidas', type: 'text' },
+        ];
+
+        // ============================================================
+        // COMPOSICIÓN FAMILIAR Y ESTADO DE SALUD (padres, hermanos, etc.)
+        // ============================================================
+        const FAMILIA_DIRECTA_CONFIG = {
+            fields: [
+                { id: 'padre_estado', label: 'Padre', type: 'select', options: ['Vivo', 'Fallecido', 'Se desconoce'] },
+                { id: 'padre_edad', label: 'Edad actual del padre', type: 'number', showIf: v => v.padre_estado === 'Vivo' },
+                { id: 'padre_salud', label: 'Estado de salud del padre', type: 'select', options: ['Aparentemente sano', 'Con enfermedades (ver antecedentes abajo)'], showIf: v => v.padre_estado === 'Vivo' },
+                { id: 'padre_edad_fallecio', label: 'Edad al fallecer (padre)', type: 'number', showIf: v => v.padre_estado === 'Fallecido' },
+                { id: 'padre_causa', label: 'Causa de muerte (padre)', type: 'text', showIf: v => v.padre_estado === 'Fallecido' },
+
+                { id: 'madre_estado', label: 'Madre', type: 'select', options: ['Viva', 'Fallecida', 'Se desconoce'] },
+                { id: 'madre_edad', label: 'Edad actual de la madre', type: 'number', showIf: v => v.madre_estado === 'Viva' },
+                { id: 'madre_salud', label: 'Estado de salud de la madre', type: 'select', options: ['Aparentemente sana', 'Con enfermedades (ver antecedentes abajo)'], showIf: v => v.madre_estado === 'Viva' },
+                { id: 'madre_edad_fallecio', label: 'Edad al fallecer (madre)', type: 'number', showIf: v => v.madre_estado === 'Fallecida' },
+                { id: 'madre_causa', label: 'Causa de muerte (madre)', type: 'text', showIf: v => v.madre_estado === 'Fallecida' },
+
+                { id: 'num_hermanos', label: 'Número total de hermanos', type: 'number' },
+                { id: 'hermanos_vivos', label: 'Hermanos vivos', type: 'number', showIf: v => v.num_hermanos > 0 },
+                { id: 'hermanos_salud', label: 'Estado de salud de los hermanos vivos', type: 'select', options: ['Aparentemente sanos', 'Con enfermedades (ver antecedentes abajo)'], showIf: v => v.num_hermanos > 0 },
+                { id: 'hermanos_fallecidos', label: 'Hermanos fallecidos', type: 'number', showIf: v => v.num_hermanos > 0 },
+                { id: 'hermanos_causa', label: 'Causa(s) de muerte de hermano(s)', type: 'text', showIf: v => v.hermanos_fallecidos > 0 },
+
+                { id: 'conyuge_estado', label: 'Cónyuge / Pareja (si aplica)', type: 'select', options: ['No aplica', 'Vivo(a) y sano(a)', 'Vivo(a) con enfermedades', 'Fallecido(a)'] },
+
+                { id: 'hijos_num', label: 'Número de hijos (si aplica)', type: 'number' },
+                { id: 'hijos_salud', label: 'Estado de salud de los hijos', type: 'select', options: ['Aparentemente sanos', 'Con enfermedades (ver antecedentes abajo)'], showIf: v => v.hijos_num > 0 },
+            ],
+            compose: v => {
+                const parts = [];
+                if (v.padre_estado === 'Vivo') parts.push(`Padre vivo${v.padre_edad ? `, ${v.padre_edad} años` : ''}, ${(v.padre_salud || 'estado de salud no especificado').toLowerCase()}`);
+                else if (v.padre_estado === 'Fallecido') parts.push(`Padre fallecido${v.padre_edad_fallecio ? ` a los ${v.padre_edad_fallecio} años` : ''}${v.padre_causa ? `, causa: ${v.padre_causa}` : ', causa no especificada'}`);
+                else if (v.padre_estado === 'Se desconoce') parts.push('Padre: se desconoce');
+
+                if (v.madre_estado === 'Viva') parts.push(`Madre viva${v.madre_edad ? `, ${v.madre_edad} años` : ''}, ${(v.madre_salud || 'estado de salud no especificado').toLowerCase()}`);
+                else if (v.madre_estado === 'Fallecida') parts.push(`Madre fallecida${v.madre_edad_fallecio ? ` a los ${v.madre_edad_fallecio} años` : ''}${v.madre_causa ? `, causa: ${v.madre_causa}` : ', causa no especificada'}`);
+                else if (v.madre_estado === 'Se desconoce') parts.push('Madre: se desconoce');
+
+                if (v.num_hermanos) {
+                    let hTxt = `${v.num_hermanos} hermano(s) en total`;
+                    if (v.hermanos_vivos) hTxt += `, ${v.hermanos_vivos} vivo(s) (${(v.hermanos_salud || 'estado no especificado').toLowerCase()})`;
+                    if (v.hermanos_fallecidos) hTxt += `, ${v.hermanos_fallecidos} fallecido(s)${v.hermanos_causa ? ` (${v.hermanos_causa})` : ''}`;
+                    parts.push(hTxt);
+                }
+
+                if (v.conyuge_estado && v.conyuge_estado !== 'No aplica') parts.push(`Cónyuge: ${v.conyuge_estado.toLowerCase()}`);
+
+                if (v.hijos_num) parts.push(`${v.hijos_num} hijo(s), ${(v.hijos_salud || 'estado de salud no especificado').toLowerCase()}`);
+
+                return parts.length ? parts.join('. ') + '.' : '';
+            }
+        };
+
+        const ANTECEDENTES_FAMILIARES = [
+            { id: 'cancer', label: 'Cáncer' },
+            { id: 'diabetes', label: 'Diabetes' },
+            { id: 'hta', label: 'Hipertensión arterial' },
+            { id: 'cardiopatias', label: 'Cardiopatías' },
+            { id: 'renal', label: 'Enfermedad renal' },
+            { id: 'digestivas', label: 'Enfermedades digestivas' },
+            { id: 'psiquiatricas', label: 'Enfermedades mentales / psiquiátricas' },
+            { id: 'tbc', label: 'Tuberculosis' },
+            { id: 'alergias', label: 'Alergias' },
+            { id: 'hereditarias', label: 'Enfermedades hereditarias / congénitas' },
+            { id: 'artritis', label: 'Artritis' },
+            { id: 'sifilis', label: 'Sífilis' },
+            { id: 'discrasias', label: 'Discrasias sanguíneas' },
+            { id: 'intoxicaciones', label: 'Intoxicaciones' },
+        ];
+
+        // ============================================================
+        // ESQUEMA DE VACUNACIÓN
+        // ============================================================
+        const VACUNACION_CONFIG = {
+            fields: [
+                { id: 'esquema', label: 'Esquema de vacunación', type: 'select', options: ['Completo para la edad', 'Incompleto', 'Desconocido', 'No aplica'] },
+                { id: 'pendientes', label: 'Vacunas o dosis pendientes', type: 'text', showIf: v => v.esquema === 'Incompleto' },
+                { id: 'refuerzo', label: 'Última dosis de refuerzo (vacuna y fecha)', type: 'text' },
+                { id: 'carnet', label: 'Carnet de vacunación disponible', type: 'select', options: ['Sí', 'No'] },
+            ],
+            compose: v => {
+                if (!v.esquema) return '';
+                let txt = `Esquema de vacunación ${v.esquema.toLowerCase()}`;
+                if (v.esquema === 'Incompleto' && v.pendientes) txt += ` (pendiente: ${v.pendientes})`;
+                txt += '.';
+                if (v.refuerzo) txt += ` Último refuerzo: ${v.refuerzo}.`;
+                if (v.carnet) txt += ` Carnet de vacunación ${v.carnet === 'Sí' ? 'disponible' : 'no disponible'}.`;
+                return txt;
+            }
+        };
+
+        // ============================================================
+        // HÁBITOS PSICOBIOLÓGICOS (campos estructurados y específicos)
+        // ============================================================
+        const HABITOS_CONFIG = {
+            alimentacion: {
+                title: 'Alimentación',
+                fields: [
+                    { id: 'tipo', label: 'Tipo de dieta', type: 'select', options: ['Balanceada / omnívora', 'Vegetariana', 'Vegana', 'Hiposódica', 'Diabética / baja en carbohidratos', 'Otra'] },
+                    { id: 'comidas', label: 'N.º de comidas al día', type: 'number' },
+                    { id: 'apetito', label: 'Apetito', type: 'select', options: ['Conservado', 'Aumentado', 'Disminuido'] },
+                    { id: 'agua', label: 'Ingesta de agua (litros/día)', type: 'number', step: '0.5' },
+                ],
+                compose: v => {
+                    if (!v.tipo && !v.comidas && !v.apetito) return '';
+                    return `Alimentación de tipo ${v.tipo || '___'}, distribuida en ${v.comidas || '___'} comidas al día. Apetito ${(v.apetito || '___').toLowerCase()}.${v.agua ? ` Ingesta hídrica aproximada de ${v.agua} L/día.` : ''}`;
+                }
+            },
+            sueño: {
+                title: 'Sueño',
+                fields: [
+                    { id: 'horas', label: 'Horas de sueño por noche', type: 'number' },
+                    { id: 'calidad', label: 'Calidad del sueño', type: 'select', options: ['Reparador', 'No reparador / interrumpido'] },
+                    { id: 'inductores', label: 'Uso de inductores del sueño', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'cual_inductor', label: '¿Cuál inductor / fármaco?', type: 'text', showIf: v => v.inductores === 'Sí' },
+                ],
+                compose: v => {
+                    if (!v.horas && !v.calidad) return '';
+                    const inductorTxt = v.inductores === 'Sí'
+                        ? `con uso de inductores del sueño${v.cual_inductor ? ` (${v.cual_inductor})` : ''}`
+                        : 'sin uso de inductores farmacológicos del sueño';
+                    return `Duerme aproximadamente ${v.horas || '___'} horas por noche, sueño ${(v.calidad || '___').toLowerCase()}, ${inductorTxt}.`;
+                }
+            },
+            eliminacion_intestinal: {
+                title: 'Hábito intestinal',
+                fields: [
+                    { id: 'frecuencia', label: 'Frecuencia evacuatoria', type: 'select', options: ['1 vez/día', '2-3 veces/día', 'Cada 2-3 días', 'Menor a 1 vez cada 3 días', 'Otra'] },
+                    { id: 'caracteristicas', label: 'Características de las heces', type: 'text', placeholder: 'Consistencia, color...' },
+                    { id: 'laxantes', label: 'Uso de laxantes', type: 'select', options: ['No', 'Sí'] },
+                ],
+                compose: v => {
+                    if (!v.frecuencia) return '';
+                    return `Hábito intestinal: ${v.frecuencia.toLowerCase()}${v.caracteristicas ? `, heces ${v.caracteristicas}` : ''}. ${v.laxantes === 'Sí' ? 'Refiere uso de laxantes.' : 'Sin uso de laxantes.'}`;
+                }
+            },
+            eliminacion_urinaria: {
+                title: 'Hábito urinario',
+                fields: [
+                    { id: 'frecuencia', label: 'N.º de micciones al día', type: 'number' },
+                    { id: 'nicturia', label: 'Nicturia', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'caracteristicas', label: 'Características de la orina', type: 'text', placeholder: 'Color, olor...' },
+                ],
+                compose: v => {
+                    if (!v.frecuencia && !v.caracteristicas) return '';
+                    return `Hábito urinario: ${v.frecuencia || '___'} micciones al día${v.nicturia === 'Sí' ? ', con nicturia' : ', sin nicturia'}.${v.caracteristicas ? ` Orina ${v.caracteristicas}.` : ''}`;
+                }
+            },
+            actividad_fisica: {
+                title: 'Actividad física / deporte',
+                fields: [
+                    { id: 'realiza', label: '¿Realiza actividad física?', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'tipo', label: 'Tipo de actividad', type: 'text', showIf: v => v.realiza === 'Sí' },
+                    { id: 'frecuencia', label: 'Frecuencia semanal (veces)', type: 'number', showIf: v => v.realiza === 'Sí' },
+                    { id: 'duracion', label: 'Duración por sesión (min)', type: 'number', showIf: v => v.realiza === 'Sí' },
+                ],
+                compose: v => {
+                    if (!v.realiza) return '';
+                    if (v.realiza === 'No') return 'Niega práctica regular de actividad física.';
+                    return `Realiza actividad física de tipo ${v.tipo || '___'}, ${v.frecuencia || '___'} veces por semana, ${v.duracion || '___'} minutos por sesión.`;
+                }
+            },
+            tabaco: {
+                title: 'Tabaco',
+                fields: [
+                    { id: 'estado', label: 'Hábito tabáquico', type: 'select', options: ['No fumador', 'Fumador activo', 'Ex-fumador'] },
+                    { id: 'cigarrillos', label: 'Cigarrillos/día', type: 'number', showIf: v => v.estado === 'Fumador activo' || v.estado === 'Ex-fumador' },
+                    { id: 'años', label: 'Años de consumo', type: 'number', showIf: v => v.estado === 'Fumador activo' || v.estado === 'Ex-fumador' },
+                    { id: 'suspension', label: 'Tiempo de suspensión', type: 'text', showIf: v => v.estado === 'Ex-fumador', placeholder: 'Ej. hace 5 años' },
+                ],
+                compose: v => {
+                    if (!v.estado) return '';
+                    if (v.estado === 'No fumador') return 'Niega hábito tabáquico.';
+                    const ipa = (v.cigarrillos && v.años) ? ((parseFloat(v.cigarrillos) / 20) * parseFloat(v.años)).toFixed(1) : null;
+                    if (v.estado === 'Ex-fumador') return `Ex-fumador de ${v.cigarrillos || '___'} cigarrillos/día durante ${v.años || '___'} años${ipa ? ` (índice paquetes-año: ${ipa})` : ''}. Suspendido ${v.suspension || '___'}.`;
+                    return `Fumador activo de ${v.cigarrillos || '___'} cigarrillos/día desde hace ${v.años || '___'} años${ipa ? ` (índice paquetes-año: ${ipa})` : ''}.`;
+                }
+            },
+            chimo: {
+                title: 'Chimo (tabaco de mascar)',
+                fields: [
+                    { id: 'consume', label: '¿Consume chimo?', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'frecuencia', label: 'Frecuencia', type: 'select', options: ['Ocasional', 'Diaria'], showIf: v => v.consume === 'Sí' },
+                    { id: 'años', label: 'Años de consumo', type: 'number', showIf: v => v.consume === 'Sí' },
+                ],
+                compose: v => {
+                    if (!v.consume) return '';
+                    if (v.consume === 'No') return 'Niega consumo de chimo.';
+                    return `Consume chimo de forma ${(v.frecuencia || '___').toLowerCase()}${v.años ? `, desde hace ${v.años} años` : ''}.`;
+                }
+            },
+            alcohol: {
+                title: 'Alcohol',
+                fields: [
+                    { id: 'consume', label: '¿Consume alcohol?', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'tipo', label: 'Tipo de bebida', type: 'text', showIf: v => v.consume === 'Sí' },
+                    { id: 'frecuencia', label: 'Frecuencia', type: 'select', options: ['Ocasional (social)', 'Semanal', 'Diaria'], showIf: v => v.consume === 'Sí' },
+                    { id: 'cantidad', label: 'Cantidad aproximada por ocasión', type: 'text', showIf: v => v.consume === 'Sí' },
+                ],
+                compose: v => {
+                    if (!v.consume) return '';
+                    if (v.consume === 'No') return 'Niega consumo de bebidas alcohólicas.';
+                    return `Consume alcohol tipo ${v.tipo || '___'}, de forma ${(v.frecuencia || '___').toLowerCase()}${v.cantidad ? `, aproximadamente ${v.cantidad} por ocasión` : ''}.`;
+                }
+            },
+            cafeina: {
+                title: 'Café / bebidas con cafeína',
+                fields: [
+                    { id: 'tazas', label: 'Tazas o porciones al día', type: 'number' },
+                ],
+                compose: v => v.tazas ? `Consume ${v.tazas} taza(s)/porción(es) de bebidas con cafeína al día.` : ''
+            },
+            otras_drogas: {
+                title: 'Otras drogas',
+                fields: [
+                    { id: 'consume', label: '¿Consume otras sustancias?', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'cual', label: '¿Cuál(es)?', type: 'text', showIf: v => v.consume === 'Sí' },
+                    { id: 'frecuencia', label: 'Frecuencia', type: 'text', showIf: v => v.consume === 'Sí' },
+                ],
+                compose: v => {
+                    if (!v.consume) return '';
+                    if (v.consume === 'No') return 'Niega consumo de otras sustancias psicoactivas.';
+                    return `Refiere consumo de ${v.cual || '___'}, con frecuencia ${v.frecuencia || '___'}.`;
+                }
+            },
+            esfera_sexual: {
+                title: 'Esfera sexual',
+                fields: [
+                    { id: 'activa', label: 'Vida sexual activa', type: 'select', options: ['No', 'Sí'] },
+                    { id: 'parejas', label: 'N.º de parejas sexuales', type: 'number', showIf: v => v.activa === 'Sí' },
+                    { id: 'metodo', label: 'Método anticonceptivo / protección', type: 'text', showIf: v => v.activa === 'Sí' },
+                ],
+                compose: v => {
+                    if (!v.activa) return '';
+                    if (v.activa === 'No') return 'Refiere vida sexual no activa actualmente.';
+                    return `Vida sexual activa${v.parejas ? `, ${v.parejas} pareja(s) sexual(es)` : ''}${v.metodo ? `, con uso de ${v.metodo}` : ', sin método de protección referido'}.`;
+                }
+            },
+            rasgos_personales: {
+                title: 'Rasgos personales / recreación / ocupación libre',
+                fields: [
+                    { id: 'notas', label: 'Observaciones', type: 'textarea' },
+                ],
+                compose: v => v.notas || ''
+            },
+        };
+
+        // ============================================================
+        // ANTECEDENTES EPIDEMIOLÓGICOS Y SOCIOAMBIENTALES
+        // ============================================================
+        const EPIDEMIOLOGICOS_CONFIG = {
+            fields: [
+                { id: 'vivienda', label: 'Tipo de vivienda', type: 'select', options: ['Casa', 'Apartamento', 'Rancho / vivienda informal', 'Otra'] },
+                { id: 'zona', label: 'Zona', type: 'select', options: ['Urbana', 'Rural'] },
+                { id: 'habitaciones', label: 'N.º de habitaciones', type: 'number' },
+                { id: 'habitantes', label: 'N.º de habitantes en el hogar', type: 'number' },
+                { id: 'num_banos', label: 'N.º de baños', type: 'number' },
+                { id: 'ubicacion_bano', label: 'Ubicación del baño', type: 'select', options: ['Interno (dentro de la vivienda)', 'Externo (fuera de la vivienda)'] },
+                { id: 'servicios', label: 'Servicios básicos', type: 'select', options: ['Completos (agua, luz, aseo)', 'Parciales', 'Deficientes'] },
+                { id: 'mascotas', label: 'Mascotas', type: 'select', options: ['No', 'Sí'] },
+                { id: 'cual_mascota', label: '¿Cuál(es)?', type: 'text', showIf: v => v.mascotas === 'Sí' },
+                { id: 'contacto_enfermos', label: 'Contacto con personas enfermas', type: 'select', options: ['No', 'Sí'] },
+                { id: 'detalle_contacto', label: 'Detalle del contacto', type: 'text', showIf: v => v.contacto_enfermos === 'Sí' },
+                { id: 'viajes', label: 'Viajes recientes', type: 'select', options: ['No', 'Sí'] },
+                { id: 'detalle_viaje', label: 'Destino y fecha', type: 'text', showIf: v => v.viajes === 'Sí' },
+                { id: 'escolaridad', label: 'Escolaridad', type: 'text' },
+                { id: 'grupo_sanguineo', label: 'Grupo sanguíneo (si se conoce)', type: 'text', placeholder: 'Ej. O+' },
+            ],
+            compose: v => {
+                const parts = [];
+                if (v.vivienda) parts.push(`Habita en ${v.vivienda.toLowerCase()} en zona ${v.zona ? v.zona.toLowerCase() : '___'}`);
+                if (v.habitaciones || v.habitantes) parts.push(`con ${v.habitaciones || '___'} habitación(es) para ${v.habitantes || '___'} habitante(s)`);
+                if (v.num_banos || v.ubicacion_bano) parts.push(`${v.num_banos || '___'} baño(s), de ubicación ${v.ubicacion_bano ? v.ubicacion_bano.toLowerCase() : '___'}`);
+                if (v.servicios) parts.push(`Servicios básicos ${v.servicios.toLowerCase()}`);
+                if (v.mascotas) parts.push(v.mascotas === 'Sí' ? `Convive con mascotas (${v.cual_mascota || 'no especifica'})` : 'Sin mascotas en el hogar');
+                if (v.contacto_enfermos) parts.push(v.contacto_enfermos === 'Sí' ? `Contacto reciente con persona enferma (${v.detalle_contacto || 'sin detalle'})` : 'Niega contacto con personas enfermas');
+                if (v.viajes) parts.push(v.viajes === 'Sí' ? `Viaje reciente a ${v.detalle_viaje || 'destino no especificado'}` : 'Niega viajes recientes');
+                if (v.escolaridad) parts.push(`Escolaridad: ${v.escolaridad}`);
+                if (v.grupo_sanguineo) parts.push(`Grupo sanguíneo: ${v.grupo_sanguineo}`);
+                return parts.length ? parts.join('. ') + '.' : '';
+            }
+        };
+
+        // ============================================================
+        // ANTECEDENTES GINECO-OBSTÉTRICOS Y DESARROLLO PSICOMOTOR
+        // ============================================================
+        const GINECO_CONFIG = {
+            fields: [
+                { id: 'menarquia', label: 'Menarquia (edad)', type: 'number' },
+                { id: 'ciclo', label: 'Ciclo (duración/frecuencia)', type: 'text', placeholder: 'Ej. 5/28 días' },
+                { id: 'fur', label: 'F.U.R.', type: 'date' },
+                { id: 'gestas', label: 'Gestas', type: 'number' },
+                { id: 'partos', label: 'Partos', type: 'number' },
+                { id: 'cesareas', label: 'Cesáreas', type: 'number' },
+                { id: 'abortos', label: 'Abortos', type: 'number' },
+                { id: 'hijos_vivos', label: 'Hijos vivos', type: 'number' },
+                { id: 'metodo', label: 'Método anticonceptivo', type: 'text' },
+                { id: 'citologia', label: 'Última citología', type: 'date' },
+                { id: 'menopausia', label: 'Menopausia (edad, si aplica)', type: 'text' },
+            ],
+            compose: v => {
+                if (!v.menarquia && !v.gestas && !v.fur) return '';
+                return `Menarquia a los ${v.menarquia || '___'} años. Ciclo ${v.ciclo || '___'}. F.U.R.: ${v.fur || '___'}. Gestas: ${v.gestas || '0'}, Partos: ${v.partos || '0'}, Cesáreas: ${v.cesareas || '0'}, Abortos: ${v.abortos || '0'}, Hijos vivos: ${v.hijos_vivos || '0'}. Método anticonceptivo: ${v.metodo || 'ninguno referido'}. Última citología: ${v.citologia || '___'}.${v.menopausia ? ` Menopausia a los ${v.menopausia}.` : ''}`;
+            }
+        };
+
+        // ============================================================
+        // ANTECEDENTES PRENATALES, OBSTÉTRICOS Y NEONATALES DEL PACIENTE
+        // (distinto de GINECO_CONFIG: esto es cómo nació EL PACIENTE, no sus propios embarazos)
+        // ============================================================
+        const PRENATAL_PACIENTE_CONFIG = {
+            fields: [
+                { id: 'controles', label: 'Controles prenatales', type: 'select', options: ['Adecuados', 'Insuficientes', 'Ninguno', 'Se desconoce'] },
+                { id: 'complicaciones', label: 'Complicaciones del embarazo', type: 'text' },
+                { id: 'tipo_parto', label: 'Tipo de parto', type: 'select', options: ['A término, normal', 'A término, instrumental', 'A término, cesárea', 'Pretérmino', 'Postérmino'] },
+                { id: 'anestesia', label: 'Parto con anestesia', type: 'select', options: ['Sí', 'No'] },
+                { id: 'asistencia', label: 'Asistencia del parto', type: 'select', options: ['Institucional', 'Domiciliaria / asistencial'] },
+            ],
+            compose: v => {
+                const parts = [];
+                if (v.controles) parts.push(`Controles prenatales ${v.controles.toLowerCase()}`);
+                if (v.complicaciones) parts.push(`Complicaciones del embarazo: ${v.complicaciones}`);
+                if (v.tipo_parto) parts.push(`Parto ${v.tipo_parto.toLowerCase()}`);
+                if (v.anestesia) parts.push(`${v.anestesia === 'Sí' ? 'Con' : 'Sin'} anestesia`);
+                if (v.asistencia) parts.push(`Asistencia ${v.asistencia.toLowerCase()}`);
+                return parts.length ? parts.join('. ') + '.' : '';
+            }
+        };
+
+        const PERIODO_NEONATAL_CONFIG = {
+            fields: [
+                { id: 'respiracion', label: 'Respiración al nacer', type: 'select', options: ['Espontánea', 'Requirió reanimación / artificial'] },
+                { id: 'apgar', label: 'APGAR (si se conoce)', type: 'text', placeholder: 'Ej. 8/9' },
+                { id: 'peso_nacer', label: 'Peso al nacer (g)', type: 'number' },
+                { id: 'complicaciones_neo', label: 'Complicaciones neonatales', type: 'text', placeholder: 'Cianosis, ictericia, convulsiones, malformaciones, etc.' },
+                { id: 'egreso_madre', label: 'Egresó junto con la madre', type: 'select', options: ['Sí', 'No'] },
+            ],
+            compose: v => {
+                const parts = [];
+                if (v.respiracion) parts.push(`Respiración al nacer: ${v.respiracion.toLowerCase()}`);
+                if (v.apgar) parts.push(`APGAR ${v.apgar}`);
+                if (v.peso_nacer) parts.push(`Peso al nacer: ${v.peso_nacer} g`);
+                if (v.complicaciones_neo) parts.push(`Complicaciones neonatales: ${v.complicaciones_neo}`);
+                if (v.egreso_madre) parts.push(`${v.egreso_madre === 'Sí' ? 'Egresó' : 'No egresó'} junto con la madre`);
+                return parts.length ? parts.join('. ') + '.' : '';
+            }
+        };
+
+        const ALIMENTACION_INFANTIL_CONFIG = {
+            fields: [
+                { id: 'tipo', label: 'Lactancia', type: 'select', options: ['Materna exclusiva', 'Artificial', 'Mixta'] },
+                { id: 'destete', label: 'Edad de destete', type: 'text', placeholder: 'Ej. 6 meses, o "aún lacta"' },
+                { id: 'ablactacion', label: 'Inicio de alimentación complementaria', type: 'text', placeholder: 'Ej. 6 meses' },
+                { id: 'dieta_actual', label: 'Dieta actual', type: 'textarea' },
+            ],
+            compose: v => {
+                const parts = [];
+                if (v.tipo) parts.push(`Lactancia ${v.tipo.toLowerCase()}`);
+                if (v.destete) parts.push(`Destete: ${v.destete}`);
+                if (v.ablactacion) parts.push(`Alimentación complementaria desde: ${v.ablactacion}`);
+                if (v.dieta_actual) parts.push(`Dieta actual: ${v.dieta_actual}`);
+                return parts.length ? parts.join('. ') + '.' : '';
+            }
+        };
+
+        const DESARROLLO_CONFIG = {
+            fields: [
+                { id: 'cabeza', label: 'Sostuvo la cabeza (meses)', type: 'number' },
+                { id: 'sento', label: 'Se sentó (meses)', type: 'number' },
+                { id: 'paro', label: 'Se paró (meses)', type: 'number' },
+                { id: 'camino', label: 'Caminó (meses)', type: 'number' },
+                { id: 'esfinteres', label: 'Control de esfínteres (meses)', type: 'number' },
+                { id: 'palabras', label: 'Primeras palabras (meses)', type: 'number' },
+                { id: 'escolar', label: 'Progreso escolar', type: 'select', options: ['Adecuado para la edad', 'Con dificultades'] },
+            ],
+            compose: v => {
+                if (!v.cabeza && !v.sento && !v.camino) return '';
+                return `Sostén cefálico a los ${v.cabeza || '___'} meses, sedestación a los ${v.sento || '___'} meses, bipedestación a los ${v.paro || '___'} meses, marcha a los ${v.camino || '___'} meses, control de esfínteres a los ${v.esfinteres || '___'} meses, primeras palabras a los ${v.palabras || '___'} meses. Progreso escolar: ${v.escolar || '___'}.`;
+            }
+        };
+
+        // ============================================================
+        // EXAMEN FUNCIONAL (Anamnesis)
+        // ============================================================
+        const EXAMEN_FUNCIONAL_TEMPLATE = {
+            general: [
+                { id: 'fiebre', label: 'Fiebre / Escalofríos', normalText: 'Niega alzas térmicas o escalofríos.' },
+                { id: 'peso', label: 'Pérdida/Aumento de peso', normalText: 'Peso estable, niega cambios recientes.' },
+                { id: 'astenia', label: 'Astenia / Debilidad', normalText: 'Niega astenia o debilidad generalizada.' },
+                { id: 'sudoracion', label: 'Sudoración nocturna', normalText: 'Niega diaforesis nocturna.' }
+            ],
+            piel: [
+                { id: 'erupciones', label: 'Erupciones / Prurito', normalText: 'Niega erupciones, máculas, pápulas o prurito.' },
+                { id: 'pigmentacion', label: 'Cambios de coloración', normalText: 'Niega cianosis, ictericia o palidez reciente.' },
+                { id: 'cabello', label: 'Caída de cabello / Uñas', normalText: 'Niega alopecia, fragilidad capilar o cambios ungueales.' }
+            ],
+            cabeza_ojos: [
+                { id: 'cefalea', label: 'Cefalea', normalText: 'Niega episodios de cefalea.' },
+                { id: 'mareos', label: 'Mareos / Síncope', normalText: 'Niega mareos, vértigo o episodios sincopales.' },
+                { id: 'vision', label: 'Alteraciones visuales', normalText: 'Niega amaurosis, diplopía, fotofobia o cansancio ocular.' }
+            ],
+            oidos_nariz_boca: [
+                { id: 'audicion', label: 'Audición', normalText: 'Niega otalgia, otorrea, acúfenos o hipoacusia.' },
+                { id: 'nariz', label: 'Nariz y Senos paranasales', normalText: 'Niega epistaxis, rinorrea, obstrucción nasal o anosmia.' },
+                { id: 'boca', label: 'Boca y Garganta', normalText: 'Niega odontalgia, halitosis, disfagia o disfonía.' }
+            ],
+            respiratorio: [
+                { id: 'disnea', label: 'Disnea', normalText: 'Niega disnea de esfuerzo o reposo, niega ortopnea.' },
+                { id: 'tos', label: 'Tos / Expectoración', normalText: 'Niega tos, expectoración o hemoptisis.' },
+                { id: 'dolor_torax', label: 'Dolor torácico pleurítico', normalText: 'Niega dolor torácico pleurítico.' },
+                { id: 'sibilancias', label: 'Sibilancias / Estridor', normalText: 'Niega sibilancias o estridor respiratorio.' }
+            ],
+            cardiovascular: [
+                { id: 'palpitaciones', label: 'Palpitaciones / Arritmias', normalText: 'Niega palpitaciones o taquicardia.' },
+                { id: 'dolor_precordial', label: 'Dolor precordial', normalText: 'Niega dolor de tipo anginoso.' },
+                { id: 'edemas', label: 'Edemas', normalText: 'Niega edemas en miembros inferiores.' },
+                { id: 'claudicacion', label: 'Claudicación intermitente', normalText: 'Niega claudicación intermitente.' }
+            ],
+            gastrointestinal: [
+                { id: 'apetito', label: 'Apetito', normalText: 'Apetito conservado.' },
+                { id: 'nauseas', label: 'Náuseas / Vómitos / Pirosis', normalText: 'Niega náuseas, vómitos o pirosis.' },
+                { id: 'evacuaciones', label: 'Hábito evacuatorio', normalText: 'Patrón evacuatorio conservado, heces de aspecto normal. Niega diarrea, constipación o melena.' },
+                { id: 'dolor_abd', label: 'Dolor abdominal / Flatulencias', normalText: 'Niega dolor abdominal, flatulencias o distensión.' },
+                { id: 'ictericia', label: 'Ictericia', normalText: 'Niega ictericia.' }
+            ],
+            genitourinario: [
+                { id: 'miccion', label: 'Hábito miccional', normalText: 'Patrón miccional conservado. Niega disuria, poliuria o nicturia.' },
+                { id: 'orina', label: 'Características de orina', normalText: 'Niega hematuria, piuria o cambios en el aspecto de la orina.' },
+                { id: 'incontinencia', label: 'Incontinencia / Secreciones', normalText: 'Niega incontinencia urinaria o secreciones uretrales.' }
+            ],
+            gineco_andrologico: [
+                { id: 'menstruacion', label: 'Trastornos menstruales', normalText: 'Ciclos menstruales regulares, sin alteraciones.' },
+                { id: 'flujo', label: 'Flujo / Secreciones', normalText: 'Niega leucorrea o secreciones anormales.' },
+                { id: 'sexualidad', label: 'Esfera sexual (funcional)', normalText: 'Niega disfunción sexual o dispareunia.' }
+            ],
+            osteomuscular: [
+                { id: 'articulaciones', label: 'Dolor articular/óseo', normalText: 'Niega artralgias, mialgias o limitación del rango de movimiento.' },
+                { id: 'fuerza', label: 'Fuerza / Deformidades', normalText: 'Niega debilidad muscular o aparición de deformidades articulares.' }
+            ],
+            endocrino: [
+                { id: 'intolerancia_temp', label: 'Intolerancia al frío/calor', normalText: 'Niega intolerancia al frío o al calor.' },
+                { id: 'poliuria_polidipsia', label: 'Poliuria / Polidipsia', normalText: 'Niega poliuria o polidipsia.' }
+            ],
+            hematologico: [
+                { id: 'sangrados', label: 'Sangrados frecuentes / Hematomas', normalText: 'Niega sangrados frecuentes o hematomas fáciles.' }
+            ],
+            neurologico: [
+                { id: 'convulsiones', label: 'Convulsiones', normalText: 'Niega historia de crisis convulsivas.' },
+                { id: 'sensibilidad', label: 'Sensibilidad', normalText: 'Niega parestesias, hipoestesias o anestesia.' },
+                { id: 'marcha', label: 'Marcha / Equilibrio / Temblor', normalText: 'Niega alteraciones de la marcha, estática o temblores.' },
+                { id: 'esfera_mental', label: 'Esfera Mental/Psíquica', normalText: 'Niega ansiedad, ánimo depresivo, alteraciones del sueño o de conducta.' }
+            ]
+        };
+
+        // ============================================================
+        // EXAMEN FÍSICO
+        // ============================================================
+        const EXAMEN_FISICO_TEMPLATE = {
+            aspecto_general: [
+                { id: 'condiciones', label: 'Condiciones Generales', normalText: 'Paciente en aparentes buenas condiciones generales.' },
+                { id: 'hidratacion', label: 'Hidratación y Nutrición', normalText: 'Euhidratado y eutrófico.' },
+                { id: 'biotipo', label: 'Biotipo y Facies', normalText: 'Biotipo normolíneo. Facies no característica.' },
+                { id: 'actitud', label: 'Actitud / Decúbito', normalText: 'Actitud activa, decúbito indiferente.' }
+            ],
+            piel_faneras: [
+                { id: 'coloracion', label: 'Coloración y Fototipo', normalText: 'Piel normocoloreada.' },
+                { id: 'turgencia', label: 'Humedad y Turgencia', normalText: 'Piel hidratada, con turgencia y elasticidad conservadas.' },
+                { id: 'temperatura', label: 'Temperatura', normalText: 'Normotérmica al tacto.' },
+                { id: 'lesiones', label: 'Lesiones / Vascularización', normalText: 'Sin lesiones, cicatrices patológicas, equimosis ni petequias aparentes.' },
+                { id: 'unas', label: 'Uñas', normalText: 'Uñas de configuración normal, sin estrías, cianosis ni acropaquia.' },
+                { id: 'cabello', label: 'Cabello', normalText: 'Cabello de buena implantación y distribución.' }
+            ],
+            cabeza: [
+                { id: 'craneo', label: 'Cráneo / Configuración', normalText: 'Normocéfalo, sin deformidades, exostosis ni endostosis.' },
+                { id: 'dolor_craneo', label: 'Sensibilidad', normalText: 'Sin puntos dolorosos a la palpación pericraneal.' }
+            ],
+            ojos: [
+                { id: 'conjuntivas', label: 'Conjuntivas y Escleras', normalText: 'Conjuntivas rosadas y húmedas, escleras anictéricas.' },
+                { id: 'pupilas', label: 'Pupilas', normalText: 'Pupilas isocóricas, normorreactivas a la luz y a la acomodación.' },
+                { id: 'movimientos', label: 'Movimientos oculares / Fondo de ojo', normalText: 'Movimientos oculares extrínsecos conservados, sin nistagmo ni estrabismo.' }
+            ],
+            oidos_nariz_boca: [
+                { id: 'pabellon', label: 'Pabellón auricular', normalText: 'Pabellones auriculares normoinsertos.' },
+                { id: 'cae', label: 'Conducto Auditivo (CAE) / Tímpano', normalText: 'CAE permeable, tímpano íntegro. Sin secreciones ni lesiones.' },
+                { id: 'fosas_nasales', label: 'Fosas Nasales', normalText: 'Permeables, tabique central, mucosas rosadas, sin secreciones ni aleteo nasal.' },
+                { id: 'labios', label: 'Labios y Mucosa oral', normalText: 'Labios simétricos, mucosas orales húmedas y de coloración normal.' },
+                { id: 'dientes', label: 'Piezas Dentarias', normalText: 'Piezas dentarias conservadas en aparente buen estado.' },
+                { id: 'lengua', label: 'Lengua y Orofaringe', normalText: 'Lengua central y húmeda. Orofaringe sin alteraciones, amígdalas no congestivas.' }
+            ],
+            cuello: [
+                { id: 'morfologia', label: 'Morfología / Movilidad', normalText: 'Cuello simétrico, cilíndrico, móvil, sin dolor a la movilización.' },
+                { id: 'tiroides', label: 'Tiroides', normalText: 'Glándula tiroides no visible ni palpable, sin nódulos.' },
+                { id: 'vasos_cuello', label: 'Vasos y Tráquea', normalText: 'Tráquea central, pulsos carotídeos presentes, sin ingurgitación yugular.' }
+            ],
+            ganglios_linfaticos: [
+                { id: 'cervicales_occipitales', label: 'Cadenas Cervicales, Occipitales y Supraclaviculares', normalText: 'No se palpan adenopatías cervicales, occipitales ni supraclaviculares.' },
+                { id: 'axilares_inguinales', label: 'Cadenas Axilares, Inguinales y Epitrocleares', normalText: 'No se palpan adenopatías axilares, inguinales ni epitrocleares.' }
+            ],
+            torax_pulmones: [
+                { id: 'inspeccion_torax', label: 'Inspección del Tórax', normalText: 'Tórax simétrico, normoexpansible, sin tiraje intercostal ni deformidades.' },
+                { id: 'palpacion_pulm', label: 'Palpación Pulmonar', normalText: 'Expansibilidad torácica y frémito vocal conservados en ambos hemitórax.' },
+                { id: 'percusion_pulm', label: 'Percusión Pulmonar', normalText: 'Sonoridad pulmonar conservada en ambos campos.' },
+                { id: 'auscultacion_pulm', label: 'Auscultación Pulmonar', normalText: 'Murmullo vesicular audible en ambos hemitórax, sin ruidos adventicios.' },
+                { id: 'senos', label: 'Mamas / Senos (Si aplica)', normalText: 'Simétricas, sin nódulos palpables, pezones sin secreciones ni retracciones.' }
+            ],
+            cardiovascular: [
+                { id: 'inspeccion_cv', label: 'Inspección precordial', normalText: 'Tórax quieto, sin latidos anormales visibles.' },
+                { id: 'palpacion_cv', label: 'Palpación (Latido de punta / Thrill)', normalText: 'Latido de punta palpable en 5to espacio intercostal izquierdo. Sin thrill.' },
+                { id: 'auscultacion_cv', label: 'Auscultación Cardíaca', normalText: 'Ruidos cardíacos rítmicos y regulares. No se auscultan soplos, galopes ni frotes.' },
+                { id: 'pulsos', label: 'Pulsos y Llenado capilar', normalText: 'Pulsos periféricos presentes y simétricos. Llenado capilar menor a 3 segundos.' }
+            ],
+            abdomen: [
+                { id: 'inspeccion_abd', label: 'Inspección', normalText: 'Abdomen plano, simétrico, sin cicatrices patológicas ni circulación colateral.' },
+                { id: 'auscultacion_abd', label: 'Auscultación', normalText: 'Ruidos hidroaéreos presentes, normoactivos.' },
+                { id: 'palpacion_abd', label: 'Palpación', normalText: 'Blando, depresible, no doloroso. Sin defensa, contractura ni tumoraciones.' },
+                { id: 'visceromegalias', label: 'Hígado, Bazo y Riñones', normalText: 'Hígado y bazo no palpables. Reborde hepático no rebasa el reborde costal. Puntos ureterales no dolorosos.' },
+                { id: 'percusion_abd', label: 'Percusión', normalText: 'Timpanismo abdominal conservado, sin ascitis.' }
+            ],
+            genitales_femeninos: [
+                { id: 'genitales_f', label: 'Genitales Externos', normalText: 'De configuración y aspecto normal. Sin lesiones ni secreciones anormales.' },
+                { id: 'genitales_f_interno', label: 'Examen ginecológico (si se realiza)', normalText: 'Cuello, vagina y anexos sin alteraciones al examen.' }
+            ],
+            genitales_masculinos: [
+                { id: 'genitales_m', label: 'Genitales Externos', normalText: 'Pene y escroto de configuración normal. Testículos descendidos, sin masas.' },
+                { id: 'prostata', label: 'Próstata (si se realiza)', normalText: 'De tamaño y consistencia normal, no dolorosa.' }
+            ],
+            recto: [
+                { id: 'recto', label: 'Región Anal / Recto', normalText: 'Tono esfinteriano conservado, sin hemorroides, fisuras ni tumoraciones.' }
+            ],
+            osteomuscular_extremidades: [
+                { id: 'extremidades', label: 'Extremidades / Trofismo', normalText: 'Simétricas, eutróficas, sin edemas ni várices. Color y temperatura conservados.' },
+                { id: 'articulaciones_fis', label: 'Articulaciones', normalText: 'Sin signos de inflamación ni deformidades. Rango de movimiento conservado.' },
+                { id: 'fuerza_muscular', label: 'Fuerza / Tono Muscular', normalText: 'Fuerza muscular conservada (V/V). Tono muscular normal.' },
+                { id: 'columna', label: 'Columna Vertebral', normalText: 'Alineación conservada, sin deformidades. Sin dolor a la palpación.' },
+                { id: 'ortolani', label: 'Maniobra de Ortolani / Barlow (caderas, pediatría)', normalText: 'Maniobras de Ortolani y Barlow negativas, sin resalte ni limitación a la abducción de caderas.' }
+            ],
+            neurologico: [
+                { id: 'conciencia', label: 'Conciencia y Orientación', normalText: 'Paciente consciente, vigil, orientado en tiempo, espacio y persona (Glasgow 15).' },
+                { id: 'pares_craneales', label: 'Pares Craneales', normalText: 'Pares craneales evaluados sin alteraciones patológicas evidentes.' },
+                { id: 'sensibilidad_fis', label: 'Sensibilidad', normalText: 'Sensibilidad táctil, dolorosa y térmica conservada y simétrica.' },
+                { id: 'reflejos', label: 'Reflejos', normalText: 'Reflejos osteotendinosos presentes y simétricos (++). Respuestas plantares flexoras.' },
+                { id: 'reflejos_arcaicos', label: 'Reflejos Arcaicos (Pediatría)', normalText: 'Normales para la edad.' },
+                { id: 'coordinacion', label: 'Coordinación y Marcha', normalText: 'Marcha estable, eukinética. Metría y diadococinesia conservadas. Romberg negativo.' }
+            ]
+        };
+
+        const SECTIONS = [
+            'Identificación',
+            'Motivo y Enf. Actual',
+            'Antecedentes Personales',
+            'Antecedentes Familiares',
+            'Hábitos Psicobiológicos',
+            'Epidemiológicos',
+            'Examen Funcional',
+            'Signos Vitales y Antropometría',
+            'Examen Físico',
+            'Diagnóstico y Plan',
+            'Evolución y Egreso'
+        ];
+
+        // ============================================================
+        // COMPONENTES UI BASE
+        // ============================================================
+        const InputText = ({ label, path, type = 'text', placeholder = '', value, onChange, readOnly = false, step }) => (
+            <div className="mb-4 flex flex-col h-full justify-end">
+                <label className="block text-sm font-bold text-slate-700 mb-1.5 leading-tight flex-1">{label}</label>
+                <input
+                    type={type}
+                    step={step}
+                    value={value || ''}
+                    onChange={!readOnly ? ((e) => onChange(path, e.target.value)) : undefined}
+                    placeholder={placeholder}
+                    readOnly={readOnly}
+                    className={`w-full p-2.5 bg-white border border-slate-200 rounded-xl shadow-[inset_0_1px_3px_rgba(0,0,0,0.04)] focus:ring-2 focus:ring-clinical-500 focus:border-clinical-500 outline-none transition-all duration-200 ${readOnly ? 'bg-gray-50 text-gray-500' : 'text-gray-800'}`}
+                />
+            </div>
+        );
+
+        const SelectInput = ({ label, path, options, value, onChange }) => (
+            <div className="mb-4 flex flex-col h-full justify-end">
+                <label className="block text-sm font-bold text-slate-700 mb-1.5 leading-tight flex-1">{label}</label>
+                <select
+                    value={value || ''}
+                    onChange={(e) => onChange(path, e.target.value)}
+                    className="w-full p-2.5 border border-slate-200 rounded-xl shadow-[inset_0_1px_3px_rgba(0,0,0,0.04)] transition-all duration-200 bg-white hover:border-clinical-300 focus:border-clinical-500 focus:ring-2 focus:ring-clinical-500 outline-none"
+                >
+                    <option value="">-- Seleccionar --</option>
+                    {options.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                </select>
+            </div>
+        );
+
+        const TextArea = ({ label, path, placeholder = '', rows = 4, value, onChange }) => (
+            <div className="mb-4 flex flex-col h-full justify-end">
+                <label className="block text-sm font-bold text-slate-700 mb-1.5 leading-tight">{label}</label>
+                <textarea
+                    rows={rows}
+                    value={value || ''}
+                    onChange={(e) => onChange(path, e.target.value)}
+                    placeholder={placeholder}
+                    className="w-full p-2.5 border border-slate-200 rounded-xl shadow-[inset_0_1px_3px_rgba(0,0,0,0.04)] transition-all duration-200 bg-white resize-y hover:border-clinical-300 focus:border-clinical-500 focus:ring-2 focus:ring-clinical-500 outline-none"
+                ></textarea>
+            </div>
+        );
+
+        // Campo genérico dentro de un ítem estructurado (hábitos, epidemiológicos, gineco, desarrollo)
+        // Deja agregar familiares con nombre libre (ej. "Abuelo materno") que luego aparecen
+        // como opción al vincular un antecedente familiar, además de los 5 roles base.
+        const FamiliaresAdicionales = ({ formData, onChange }) => {
+            const lista = getNestedValue(formData, 'familia_directa.otros_familiares', []);
+            const listaSegura = Array.isArray(lista) ? lista : [];
+            const [nuevo, setNuevo] = useState('');
+
+            const agregar = () => {
+                const val = nuevo.trim();
+                if (!val) return;
+                onChange('familia_directa.otros_familiares', [...listaSegura, val]);
+                setNuevo('');
+            };
+
+            const quitar = (idx) => {
+                onChange('familia_directa.otros_familiares', listaSegura.filter((_, i) => i !== idx));
+            };
+
+            return (
+                <div className="mb-5 p-4 border border-dashed border-gray-300 rounded-xl bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100">
+                    <h4 className="font-bold text-clinical-800 mb-1 text-sm">Otros familiares (abuelos, tíos, etc.)</h4>
+                    <p className="text-xs text-gray-500 mb-3">Agrégalos aquí para poder vincularles antecedentes específicos más abajo — por ejemplo, "Abuelo materno".</p>
+                    <div className="flex gap-2 mb-3">
+                        <input
+                            type="text"
+                            value={nuevo}
+                            onChange={(e) => setNuevo(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); agregar(); } }}
+                            placeholder="Ej: Abuelo materno"
+                            className="flex-1 px-2.5 py-1.5 text-base border border-slate-200 rounded-xl shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-all duration-200 bg-white hover:border-clinical-300 focus:border-clinical-500 focus:ring-4 focus:ring-clinical-500/10"
+                        />
+                        <button onClick={agregar} className="px-3 py-1.5 bg-clinical-500 text-white shadow-md text-base font-semibold rounded-xl hover:bg-clinical-600 shadow-sm hover:shadow-md hover:-translate-y-0.5 transition-all shrink-0">Agregar</button>
+                    </div>
+                    {listaSegura.length > 0 && (
+                        <div className="flex flex-wrap gap-2">
+                            {listaSegura.map((nombre, idx) => (
+                                <span key={idx} className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-gray-300 rounded-full text-xs font-medium text-gray-700">
+                                    {nombre}
+                                    <button onClick={() => quitar(idx)} className="text-gray-400 hover:text-red-600" title="Quitar">
+                                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="3" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
+                                </span>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const DynField = ({ field, values, onFieldChange }) => {
+            if (field.showIf && !field.showIf(values)) return null;
+            const val = values[field.id] || '';
+            if (field.type === 'select') {
+                return (
+                    <div className="mb-3 flex flex-col h-full justify-end">
+                        <label className="block text-xs font-bold text-slate-700 mb-1.5 leading-tight flex-1">{field.label}</label>
+                        <select value={val} onChange={(e) => onFieldChange(field.id, e.target.value)} className="w-full p-2 text-base border border-slate-200 rounded-xl shadow-[inset_0_1px_3px_rgba(0,0,0,0.04)] transition-all duration-200 bg-white hover:border-clinical-300 focus:border-clinical-500 focus:ring-2 focus:ring-clinical-500 outline-none">
+                            <option value="">--</option>
+                            {field.options.map(opt => <option key={opt} value={opt}>{opt}</option>)}
+                        </select>
+                    </div>
+                );
+            }
+            if (field.type === 'textarea') {
+                return (
+                    <div className="mb-3 col-span-1 sm:col-span-2 md:col-span-3 flex flex-col h-full justify-end">
+                        <label className="block text-xs font-bold text-slate-700 mb-1.5 leading-tight">{field.label}</label>
+                        <textarea rows={2} value={val} onChange={(e) => onFieldChange(field.id, e.target.value)} placeholder={field.placeholder || ''} className="w-full p-2 text-base border border-slate-200 rounded-xl shadow-[inset_0_1px_3px_rgba(0,0,0,0.04)] transition-all duration-200 bg-white resize-y hover:border-clinical-300 focus:border-clinical-500 focus:ring-2 focus:ring-clinical-500 outline-none" />
+                    </div>
+                );
+            }
+            return (
+                <div className="mb-3 flex flex-col h-full justify-end">
+                    <label className="block text-xs font-bold text-slate-700 mb-1.5 leading-tight flex-1">{field.label}</label>
+                    <input type={field.type || 'text'} step={field.step} value={val} onChange={(e) => onFieldChange(field.id, e.target.value)} placeholder={field.placeholder || ''} className="w-full p-2 text-base border border-slate-200 rounded-xl shadow-[inset_0_1px_3px_rgba(0,0,0,0.04)] transition-all duration-200 bg-white hover:border-clinical-300 focus:border-clinical-500 focus:ring-2 focus:ring-clinical-500 outline-none" />
+                </div>
+            );
+        };
+
+        // Ítem estructurado: renderiza sus campos + texto clínico auto-compuesto (en vivo) + notas adicionales
+        const StructuredItem = ({ title, config, basePath, formData, onChange, collapsible = false }) => {
+            const values = getNestedValue(formData, basePath, {});
+            const notas = getNestedValue(formData, `${basePath}.notas`, '');
+            const onFieldChange = (fieldId, val) => onChange(`${basePath}.${fieldId}`, val);
+            const composed = config.compose(values);
+
+            return (
+                <div className="mb-6 p-5 border border-gray-100 rounded-2xl bg-white shadow-sm hover:shadow-md transition-all duration-300 hover:border-clinical-200">
+                    <h4 className="font-bold text-clinical-800 mb-3 flex items-center gap-2">{title}</h4>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1">
+                        {config.fields.map(f => <DynField key={f.id} field={f} values={values} onFieldChange={onFieldChange} />)}
+                    </div>
+                    {composed && (
+                        <div className="mt-2 p-3 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 border border-clinical-200 rounded-lg text-sm text-clinical-900 italic">
+                            {composed}
+                        </div>
+                    )}
+                    <div className="mt-3">
+                        <label className="block text-xs font-semibold text-gray-600 mb-1">Notas adicionales (opcional)</label>
+                        <textarea rows={2} value={notas} onChange={(e) => onChange(`${basePath}.notas`, e.target.value)} className="w-full px-2.5 py-1.5 text-base border border-slate-200 rounded-xl shadow-[inset_0_1px_2px_rgba(0,0,0,0.03)] transition-all duration-200 bg-white resize-y hover:border-clinical-300 focus:border-clinical-500 focus:ring-4 focus:ring-clinical-500/10" placeholder="Cualquier detalle extra que no encaje en los campos de arriba..." />
+                    </div>
+                </div>
+            );
+        };
+
+        // Ítem tipo Niega / Refiere (antecedentes patológicos, quirúrgicos, familiares)
+        const NiegaRefiereItem = ({ item, basePath, formData, onChange, familiares }) => {
+            const statusPath = `${basePath}.${item.id}.status`;
+            const detailPath = `${basePath}.${item.id}.detalle`;
+            const familiarPath = `${basePath}.${item.id}.familiar`;
+            const status = getNestedValue(formData, statusPath, '');
+            const detalle = getNestedValue(formData, detailPath, '');
+            const familiar = getNestedValue(formData, familiarPath, '');
+
+            return (
+                <div className="mb-2.5 p-3 border border-gray-200 rounded-lg bg-white flex flex-col gap-2">
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4">
+                        <span className="flex-1 text-sm font-medium text-gray-800">{item.label}</span>
+                        <div className="flex bg-gray-100 rounded-lg p-1 w-fit border border-gray-200 shrink-0">
+                            <button onClick={() => onChange(statusPath, 'niega')} className={`px-3 py-1 text-xs rounded-md transition-colors ${status === 'niega' ? 'bg-white shadow text-gray-700 font-semibold' : 'text-gray-500 hover:text-gray-700'}`}>Niega</button>
+                            <button onClick={() => onChange(statusPath, 'refiere')} className={`px-3 py-1 text-xs rounded-md transition-colors ${status === 'refiere' ? 'bg-amber-500 text-white shadow font-semibold' : 'text-gray-500 hover:text-gray-700'}`}>Refiere</button>
+                        </div>
+                    </div>
+                    {status === 'refiere' && (
+                        <div className="flex flex-col sm:flex-row gap-2">
+                            {familiares && (
+                                <select value={familiar} onChange={(e) => onChange(familiarPath, e.target.value)} className="px-2.5 py-1.5 text-sm border border-amber-300 rounded-lg bg-amber-50 focus:border-amber-500 sm:w-44 shrink-0">
+                                    <option value="">¿A quién se refiere?</option>
+                                    {familiares.map(f => <option key={f} value={f}>{f}</option>)}
+                                    <option value="Otro / no especificado">Otro / no especificado</option>
+                                </select>
+                            )}
+                            <input
+                                type="text"
+                                value={detalle}
+                                onChange={(e) => onChange(detailPath, e.target.value)}
+                                placeholder={item.detailPlaceholder || 'Detalles...'}
+                                className="flex-1 min-w-[140px] px-2.5 py-1.5 text-sm border border-amber-300 rounded-lg bg-amber-50 focus:border-amber-500"
+                            />
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const NiegaRefiereGroup = ({ title, items, basePath, formData, onChange, familiares }) => {
+            // Modo con vínculo a familiares (solo Antecedentes Familiares): "Otros" es una
+            // lista repetible de {texto, familiar}, para poder decir a quién corresponde cada uno.
+            if (familiares) {
+                const otrosLista = getNestedValue(formData, `${basePath}.otros_lista`, []);
+                const listaSegura = Array.isArray(otrosLista) ? otrosLista : [];
+                const otrosPath = `${basePath}.otros_lista`;
+
+                const agregarOtro = () => onChange(otrosPath, [...listaSegura, { texto: '', familiar: '' }]);
+                const actualizarOtro = (idx, campo, val) => onChange(otrosPath, listaSegura.map((o, i) => i === idx ? { ...o, [campo]: val } : o));
+                const quitarOtro = (idx) => onChange(otrosPath, listaSegura.filter((_, i) => i !== idx));
+
+                return (
+                    <div className="mb-6">
+                        {title && <h3 className="text-base font-bold text-clinical-800 mb-3 flex items-center gap-2 border-b-2 border-clinical-200 pb-1.5">{title}</h3>}
+                        {items.map(item => <NiegaRefiereItem key={item.id} item={item} basePath={basePath} formData={formData} onChange={onChange} familiares={familiares} />)}
+                        <div className="mt-2 p-3 border border-dashed border-gray-300 rounded-lg bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100">
+                            <label className="block text-xs font-semibold text-gray-600 mb-2">Otros antecedentes no mencionados arriba</label>
+                            {listaSegura.map((o, idx) => (
+                                <div key={idx} className="flex flex-col sm:flex-row gap-2 mb-2">
+                                    <select value={o.familiar} onChange={(e) => actualizarOtro(idx, 'familiar', e.target.value)} className="px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg bg-white sm:w-44 shrink-0">
+                                        <option value="">¿A quién se refiere?</option>
+                                        {familiares.map(f => <option key={f} value={f}>{f}</option>)}
+                                        <option value="Otro / no especificado">Otro / no especificado</option>
+                                    </select>
+                                    <input type="text" value={o.texto} onChange={(e) => actualizarOtro(idx, 'texto', e.target.value)} placeholder="Antecedente..." className="flex-1 px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg bg-white focus:border-clinical-500 focus:ring-2 focus:ring-clinical-200" />
+                                    <button onClick={() => quitarOtro(idx)} className="text-gray-400 hover:text-red-600 px-2 shrink-0" title="Quitar">
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                                    </button>
+                                </div>
+                            ))}
+                            <button onClick={agregarOtro} className="text-sm font-semibold text-clinical-600 hover:text-clinical-800 mt-1">+ Agregar otro antecedente</button>
+                        </div>
+                    </div>
+                );
+            }
+
+            // Modo simple (Antecedentes Personales / Quirúrgicos): un solo campo de texto libre.
+            const otrosPath = `${basePath}.otros_texto`;
+            const otrosVal = getNestedValue(formData, otrosPath, '');
+            return (
+                <div className="mb-6">
+                    {title && <h3 className="text-base font-bold text-clinical-800 mb-3 flex items-center gap-2 border-b-2 border-clinical-200 pb-1.5">{title}</h3>}
+                    {items.map(item => <NiegaRefiereItem key={item.id} item={item} basePath={basePath} formData={formData} onChange={onChange} />)}
+                    <div className="mt-2 p-3 border border-dashed border-gray-300 rounded-lg bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100">
+                        <label className="block text-xs font-semibold text-gray-600 mb-1">Otros antecedentes no mencionados arriba</label>
+                        <textarea rows={2} value={otrosVal} onChange={(e) => onChange(otrosPath, e.target.value)} className="w-full px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg bg-white resize-y focus:border-clinical-500 focus:ring-2 focus:ring-clinical-200" placeholder="Cualquier antecedente adicional que no esté en la lista..." />
+                    </div>
+                </div>
+            );
+        };
+
+        // Ítem tipo Omitir / Normal / Patológico (examen funcional, examen físico)
+        const ExamItemToggle = ({ item, statePath, formData, onChange }) => {
+            const statusPath = `${statePath}.${item.id}.status`;
+            const textPath = `${statePath}.${item.id}.text`;
+
+            const status = getNestedValue(formData, statusPath, 'omit');
+            const text = getNestedValue(formData, textPath, '');
+
+            const setStatus = (newStatus) => {
+                onChange(statusPath, newStatus);
+                if (newStatus === 'normal') {
+                    onChange(textPath, item.normalText);
+                } else if (newStatus === 'omit') {
+                    onChange(textPath, '');
+                } else if (newStatus === 'pathological') {
+                    if (!text || status === 'omit' || status === 'normal') {
+                        onChange(textPath, item.normalText);
+                    }
+                }
+            };
+
+            const isUneditedPathological = status === 'pathological' && text === item.normalText;
+
+            return (
+                <div className="mb-4 p-4 border border-gray-100 rounded-xl bg-white shadow-sm hover:shadow-md transition-all duration-200">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between mb-3 gap-3">
+                        <span className="font-medium text-gray-800">{item.label}</span>
+                        <div className="flex bg-gray-100 rounded-lg p-1 w-fit border border-gray-200">
+                            <button onClick={() => setStatus('omit')} className={`px-3 py-1.5 text-sm rounded-md transition-colors ${status === 'omit' ? 'bg-white shadow text-gray-700 font-medium' : 'text-gray-500 hover:text-gray-700'}`}>Omitir</button>
+                            <button onClick={() => setStatus('normal')} className={`px-3 py-1.5 text-sm rounded-md transition-colors ${status === 'normal' ? 'bg-clinical-500 text-white shadow-md shadow font-medium' : 'text-gray-500 hover:text-gray-700'}`}>Normal</button>
+                            <button onClick={() => setStatus('pathological')} className={`px-3 py-1.5 text-sm rounded-md transition-colors ${status === 'pathological' ? 'bg-amber-500 text-white shadow font-medium' : 'text-gray-500 hover:text-gray-700'}`}>Patológico</button>
+                        </div>
+                    </div>
+
+                    {(status === 'normal' || status === 'pathological') && (
+                        <textarea
+                            value={text}
+                            onChange={(e) => onChange(textPath, e.target.value)}
+                            className={`w-full px-3 py-2 text-sm border rounded-lg resize-y 
+                                ${status === 'normal' ? 'bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 border-clinical-200 text-clinical-900 focus:border-clinical-400 focus:ring-2 focus:ring-clinical-200' :
+                                (isUneditedPathological ? 'bg-amber-50 border-amber-200 text-gray-400 font-light italic focus:text-amber-900 focus:font-normal' : 'bg-amber-50 border-amber-300 text-amber-900 focus:border-amber-500')}`}
+                            rows="2"
+                        />
+                    )}
+                </div>
+            );
+        };
+
+        const SystemGroup = ({ title, template, basePath, formData, onChange }) => {
+            const otrosPath = `${basePath}.otros_hallazgos`;
+            const otrosVal = getNestedValue(formData, otrosPath, '');
+            return (
+                <div className="mb-8 bg-gradient-to-b from-gray-50 to-white p-5 rounded-2xl border border-gray-100 shadow-sm">
+                    <h3 className="text-lg font-extrabold text-clinical-800 mb-4 border-b-2 border-clinical-200 pb-2.5 capitalize flex items-center gap-2">{title.replace(/_/g, ' ')}</h3>
+                    {template.map(item => (
+                        <ExamItemToggle key={item.id} item={item} statePath={basePath} formData={formData} onChange={onChange} />
+                    ))}
+                    <div className="mt-1 p-3 border border-dashed border-gray-300 rounded-lg bg-white">
+                        <label className="block text-xs font-semibold text-gray-600 mb-1">Otros hallazgos de este sistema (no descritos arriba)</label>
+                        <textarea rows={2} value={otrosVal} onChange={(e) => onChange(otrosPath, e.target.value)} className="w-full px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg bg-white resize-y focus:border-clinical-500 focus:ring-2 focus:ring-clinical-200" placeholder="..." />
+                    </div>
+                </div>
+            );
+        };
+
+        // Tabla dinámica de notas de evolución
+        const EvolucionTable = ({ formData, onChange }) => {
+            const rows = getNestedValue(formData, 'evolucion.notas', []);
+            const list = Array.isArray(rows) ? rows : [];
+
+            const addRow = () => {
+                onChange('evolucion.notas', [...list, { fecha: '', hora: '', nota: '' }]);
+            };
+            const updateRow = (idx, field, val) => {
+                const copy = list.map((r, i) => i === idx ? { ...r, [field]: val } : r);
+                onChange('evolucion.notas', copy);
+            };
+            const removeRow = (idx) => {
+                onChange('evolucion.notas', list.filter((_, i) => i !== idx));
+            };
+
+            return (
+                <div className="mb-6">
+                    <div className="flex items-center justify-between mb-3">
+                        <h3 className="text-lg font-bold text-clinical-800">Notas de Evolución</h3>
+                        <button onClick={addRow} className="px-3 py-1.5 bg-clinical-500 text-white shadow-md text-sm rounded-lg hover:bg-clinical-600 font-semibold shadow-sm">+ Agregar nota</button>
+                    </div>
+                    {list.length === 0 && <p className="text-sm text-gray-400 italic">Sin notas de evolución registradas.</p>}
+                    {list.map((row, idx) => (
+                        <div key={idx} className="mb-3 p-3 border border-gray-200 rounded-xl bg-white shadow-sm">
+                            <div className="flex gap-3 mb-2">
+                                <input type="date" value={row.fecha} onChange={(e) => updateRow(idx, 'fecha', e.target.value)} className="px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg" />
+                                <input type="time" value={row.hora} onChange={(e) => updateRow(idx, 'hora', e.target.value)} className="px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg" />
+                                <button onClick={() => removeRow(idx)} className="ml-auto px-2.5 py-1 text-xs text-red-500 hover:bg-red-50 rounded-lg font-semibold">Eliminar</button>
+                            </div>
+                            <textarea rows={2} value={row.nota} onChange={(e) => updateRow(idx, 'nota', e.target.value)} placeholder="Evolución del paciente..." className="w-full px-2.5 py-1.5 text-sm border border-gray-300 rounded-lg resize-y" />
+                        </div>
+                    ))}
+                </div>
+            );
+        };
+
+        // ============================================================
+        // LISTA DE HISTORIAS GUARDADAS ("Mis Historias Clínicas")
+        // ============================================================
+        const RecordsListView = ({ records, onOpen, onNew, onDelete, isOnline }) => {
+            const sorted = [...records].sort((a, b) => new Date(b.actualizado) - new Date(a.actualizado));
+            return (
+                <div className="min-h-screen flex flex-col bg-slate-100">
+                    <header className="bg-clinical-900/90 backdrop-blur-xl text-white shadow-[0_4px_30px_rgba(0,0,0,0.08)] sticky top-0 z-20 border-b border-clinical-800">
+                        <div className="max-w-4xl mx-auto px-5 py-4 flex justify-between items-center gap-4">
+                            <div className="flex flex-col min-w-0">
+                                <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight leading-tight truncate">Mis Historias</h1>
+                                <span className="text-xs font-semibold text-clinical-200 opacity-90 mt-0.5 tracking-wider uppercase">
+                                    por Luis A. Medina Franco
+                                </span>
+                            </div>
+                            <div className="flex gap-2">
+                                <button onClick={onNew} className="px-5 py-2.5 bg-white text-clinical-900 hover:bg-clinical-50 rounded-full shadow-[0_2px_10px_rgba(0,0,0,0.1)] hover:-translate-y-0.5 transition-all flex items-center text-sm font-bold flex-shrink-0">
+                                    <svg className="w-4 h-4 mr-1.5 sm:mr-2 text-clinical-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 4v16m8-8H4"></path></svg>
+                                    <span className="hidden sm:inline">Nueva Historia</span>
+                                    <span className="sm:hidden">Nueva</span>
+                                </button>
+                            </div>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 max-w-4xl mx-auto w-full p-4 md:p-6">
+                        <p className="text-xs text-gray-500 mb-5 bg-white/60 p-3 rounded-xl border border-gray-200/50">
+                            Tus historias se guardan únicamente en este dispositivo, sin necesidad de internet. Toca una para seguir llenándola o para registrar el egreso.
+                        </p>
+
+                        {sorted.length === 0 ? (
+                            <div className="text-center py-20 px-4 bg-white rounded-2xl border-2 border-dashed border-gray-200 shadow-sm">
+                                <svg className="w-16 h-16 mx-auto mb-4 text-gray-300" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="1.5" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                                <p className="text-gray-400 mb-5 text-sm">Todavía no tienes historias clínicas guardadas.</p>
+                                <button onClick={onNew} className="px-6 py-3 rounded-xl font-bold text-white bg-gradient-to-r from-clinical-500 to-clinical-600 hover:from-clinical-600 hover:to-clinical-700 shadow-md hover:shadow-lg hover:-translate-y-0.5 transition-all">
+                                    + Crear la primera historia
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="space-y-3">
+                                {sorted.map(record => (
+                                    <div key={record.id} className="bg-white rounded-2xl border border-gray-100 shadow-sm p-4 flex items-center justify-between gap-3 hover:border-clinical-300 hover:shadow-md hover:-translate-y-0.5 transition-all duration-200 border-l-4 border-l-clinical-400 animate-slide-up">
+                                        <button onClick={() => onOpen(record.id)} className="flex-1 text-left min-w-0">
+                                            <div className="font-bold text-gray-800 truncate">{record.nombre}</div>
+                                            <div className="text-xs text-gray-500 mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                                                {record.historia_no && <span>Historia N.º {record.historia_no}</span>}
+                                                {record.fecha_ingreso && <span>Ingreso: {record.fecha_ingreso}</span>}
+                                                <span className={`inline-flex items-center px-2 py-0.5 rounded-full font-semibold ${record.tiene_egreso ? 'bg-green-100 text-green-700' : 'bg-amber-100 text-amber-700'}`}>
+                                                    {record.tiene_egreso ? 'Con egreso registrado' : 'En curso'}
+                                                </span>
+                                            </div>
+                                        </button>
+                                        <button onClick={() => onDelete(record.id)} className="p-2 text-gray-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors flex-shrink-0" title="Eliminar esta historia">
+                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                        </button>
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+                    </main>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // APP PRINCIPAL
+        // ============================================================
+        function App() {
+            const [view, setView] = useState('list'); // 'list' (Mis Historias) | 'editor' (formulario)
+            const [recordIndex, setRecordIndex] = useState([]);
+            const [activeRecordId, setActiveRecordId] = useState(null);
+            const [currentStep, setCurrentStep] = useState(0);
+            const [formData, setFormData] = useState({});
+            const [isLoaded, setIsLoaded] = useState(false);
+            const [isOnline, setIsOnline] = useState(navigator.onLine);
+            const [confirmAction, setConfirmAction] = useState(null); // null | {type:'clear'} | {type:'delete', id}
+
+            useEffect(() => {
+                let idx = [];
+                try { idx = JSON.parse(localStorage.getItem('hc_index') || '[]'); } catch (e) { idx = []; }
+
+                // Migración desde la versión anterior (un solo registro autoguardado).
+                // Si ya existe una historia sin terminar de una versión previa de la app,
+                // se conserva como el primer registro de la nueva lista en vez de perderse.
+                const legacy = localStorage.getItem('historiaClinicaData');
+                if (legacy && idx.length === 0) {
+                    try {
+                        const legacyData = JSON.parse(legacy);
+                        if (legacyData && Object.keys(legacyData).length > 0) {
+                            const id = 'hc_' + Date.now();
+                            localStorage.setItem('hc_record_' + id, legacy);
+                            idx = [buildIndexEntry(id, legacyData)];
+                            localStorage.setItem('hc_index', JSON.stringify(idx));
+                        }
+                    } catch (e) { /* dato previo corrupto, se ignora */ }
+                    localStorage.removeItem('historiaClinicaData');
+                }
+
+                setRecordIndex(idx);
+                setIsLoaded(true);
+
+                const goOnline = () => setIsOnline(true);
+                const goOffline = () => { setIsOnline(false); };
+                window.addEventListener('online', goOnline);
+                window.addEventListener('offline', goOffline);
+
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.register('sw.js').catch(() => {});
+                }
+
+                return () => {
+                    window.removeEventListener('online', goOnline);
+                    window.removeEventListener('offline', goOffline);
+                };
+            }, []);
+
+            // Autoguardado: solo mientras se edita un registro activo, y guarda en SU
+            // propia clave (no una sola global), además de refrescar su resumen en el índice.
+            useEffect(() => {
+                if (isLoaded && view === 'editor' && activeRecordId) {
+                    localStorage.setItem('hc_record_' + activeRecordId, JSON.stringify(formData));
+                    setRecordIndex(prev => {
+                        const updated = prev.map(r => r.id === activeRecordId ? buildIndexEntry(activeRecordId, formData) : r);
+                        localStorage.setItem('hc_index', JSON.stringify(updated));
+                        return updated;
+                    });
+                }
+            }, [formData, isLoaded, view, activeRecordId]);
+
+            const startNewRecord = () => {
+                const id = 'hc_' + Date.now();
+                const emptyData = {};
+                localStorage.setItem('hc_record_' + id, JSON.stringify(emptyData));
+                setRecordIndex(prev => {
+                    const updated = [...prev, buildIndexEntry(id, emptyData)];
+                    localStorage.setItem('hc_index', JSON.stringify(updated));
+                    return updated;
+                });
+                setFormData(emptyData);
+                setActiveRecordId(id);
+                setCurrentStep(0);
+                setView('editor');
+            };
+
+            const openRecord = (id) => {
+                const raw = localStorage.getItem('hc_record_' + id);
+                let data = {};
+                try { data = raw ? JSON.parse(raw) : {}; } catch (e) { data = {}; }
+                setFormData(data);
+                setActiveRecordId(id);
+                setCurrentStep(0);
+                setView('editor');
+            };
+
+            const backToList = () => {
+                setView('list');
+                setActiveRecordId(null);
+            };
+
+            const requestClearCurrent = () => setConfirmAction({ type: 'clear' });
+            const requestDeleteRecord = (id) => setConfirmAction({ type: 'delete', id });
+
+            const executeConfirm = () => {
+                if (!confirmAction) return;
+                if (confirmAction.type === 'clear') {
+                    setFormData({});
+                    if (activeRecordId) {
+                        localStorage.setItem('hc_record_' + activeRecordId, JSON.stringify({}));
+                        setRecordIndex(prev => {
+                            const updated = prev.map(r => r.id === activeRecordId ? buildIndexEntry(activeRecordId, {}) : r);
+                            localStorage.setItem('hc_index', JSON.stringify(updated));
+                            return updated;
+                        });
+                    }
+                    setCurrentStep(0);
+                } else if (confirmAction.type === 'delete') {
+                    localStorage.removeItem('hc_record_' + confirmAction.id);
+                    setRecordIndex(prev => {
+                        const updated = prev.filter(r => r.id !== confirmAction.id);
+                        localStorage.setItem('hc_index', JSON.stringify(updated));
+                        return updated;
+                    });
+                }
+                setConfirmAction(null);
+            };
+
+            const changeStep = (newStep) => {
+                setCurrentStep(newStep);
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+            };
+
+            const handleUpdate = (path, value) => {
+                setFormData(prev => {
+                    const newData = { ...prev };
+                    const keys = path.split('.');
+                    let current = newData;
+                    for (let i = 0; i < keys.length - 1; i++) {
+                        if (!current[keys[i]]) current[keys[i]] = {};
+                        current = current[keys[i]];
+                    }
+                    current[keys[keys.length - 1]] = value;
+
+                    if (path === 'vitales.peso' || path === 'vitales.talla') {
+                        const peso = parseFloat(getNestedValue(newData, 'vitales.peso', '0'));
+                        const tallaCm = parseFloat(getNestedValue(newData, 'vitales.talla', '0'));
+
+                        if (!newData.vitales) newData.vitales = {};
+                        if (peso > 0 && tallaCm > 0) {
+                            const tallaM = tallaCm / 100;
+                            newData.vitales.imc = (peso / (tallaM * tallaM)).toFixed(2);
+                        } else {
+                            newData.vitales.imc = '';
+                        }
+                    }
+
+                    if (path === 'vitales.cintura' || path === 'vitales.cadera') {
+                        const cintura = parseFloat(getNestedValue(newData, 'vitales.cintura', '0'));
+                        const cadera = parseFloat(getNestedValue(newData, 'vitales.cadera', '0'));
+
+                        if (!newData.vitales) newData.vitales = {};
+                        if (cintura > 0 && cadera > 0) {
+                            newData.vitales.icc = (cintura / cadera).toFixed(2);
+                        } else {
+                            newData.vitales.icc = '';
+                        }
+                    }
+
+                    return newData;
+                });
+            };
+
+            const getVal = (path, defaultValue = '') => getNestedValue(formData, path, defaultValue);
+
+            // Nota: se evita window.confirm() porque no se dispara de forma confiable en
+            // algunos navegadores WebView / PWA instalada en pantalla de inicio. Se usa
+            // en su lugar un modal propio (ver más abajo, confirmAction / executeConfirm).
+
+                        const exportWordDocument = () => {
+                let htmlContent = `
+                    <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; font-size: 11px; color: #1f2937; line-height: 1.5;">
+                        <div style="text-align: center; border-bottom: 2px solid #8dc63f; padding-bottom: 8px; margin-bottom: 15px;">
+                            <h1 style="font-size: 20px; font-weight: bold; margin: 0; text-transform: uppercase; color: #38521c;">HISTORIA CLÍNICA</h1>
+                        </div>
+                `;
+
+                // 1. IDENTIFICACION
+                htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-bottom: 8px; padding-bottom: 2px; text-transform: uppercase;">Identificación del Paciente</h2>`;
+                
+                const idFields = [];
+                const addIdRow = (label, path) => {
+                    const val = getVal(path);
+                    if (val) idFields.push(`<strong>${label}:</strong> ${val}`);
+                };
+
+                const fechaIngresoPdf = getVal('id.fecha'); const horaIngresoPdf = getVal('id.hora_ingreso');
+                if (fechaIngresoPdf || horaIngresoPdf) idFields.push(`<strong>Fecha / Hora de Ingreso:</strong> ${fechaIngresoPdf || '___'} ${horaIngresoPdf || ''}`);
+
+                addIdRow('Historia No.', 'id.numero'); addIdRow('Tipo de Ingreso', 'id.tipo_ingreso');
+                addIdRow('Apellidos', 'id.apellidos'); addIdRow('Nombres', 'id.nombres');
+                addIdRow('Cédula', 'id.cedula'); addIdRow('Fecha de Nacimiento', 'id.fecha_nacimiento');
+                addIdRow('Edad', 'id.edad'); addIdRow('Sexo', 'id.sexo');
+                addIdRow('Estado Civil', 'id.estado_civil'); addIdRow('Ocupación', 'id.ocupacion');
+                addIdRow('Lugar Nacimiento', 'id.lugar_nacimiento'); addIdRow('Religión', 'id.religion');
+                addIdRow('Seguro / SSO', 'id.seguro'); addIdRow('Servicio', 'id.servicio');
+                addIdRow('Teléfono', 'id.telefono'); addIdRow('Email', 'id.email');
+                addIdRow('Dirección', 'id.direccion'); addIdRow('F. Admisión anterior', 'id.admision_anterior');
+                addIdRow('Sala / Cuarto / Cama', 'id.sala');
+
+                const medNombrePdf = getVal('id.medico_nombre'); const medCedulaPdf = getVal('id.medico_cedula');
+                if (medNombrePdf) idFields.push(`<strong>Médico:</strong> ${medNombrePdf}${medCedulaPdf ? ' (M.P.P.S. ' + medCedulaPdf + ')' : ''}`);
+
+                const repNombrePdf = getVal('id.representante_nombre');
+                if (repNombrePdf) idFields.push(`<strong>Representante:</strong> ${repNombrePdf}${getVal('id.representante_parentesco') ? ' — ' + getVal('id.representante_parentesco') : ''}${getVal('id.representante_cedula') ? ' (C.I. ' + getVal('id.representante_cedula') + ')' : ''}`);
+
+                addIdRow('Avisar a (Nombre)', 'id.emergencia_nombre'); addIdRow('Parentesco y Teléfono', 'id.emergencia_parentesco');
+
+                // Usamos tabla para compatibilidad perfecta con Microsoft Word
+                htmlContent += `<table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 11px;"><tr><td style="width: 50%; vertical-align: top; padding-right: 10px;">`;
+                const half = Math.ceil(idFields.length / 2);
+                for (let i = 0; i < half; i++) htmlContent += `<div style="margin-bottom: 4px;">${idFields[i]}</div>`;
+                htmlContent += `</td><td style="width: 50%; vertical-align: top; padding-left: 10px;">`;
+                for (let i = half; i < idFields.length; i++) htmlContent += `<div style="margin-bottom: 4px;">${idFields[i]}</div>`;
+                htmlContent += `</td></tr></table>`;
+
+                // 2. CONSENTIMIENTO
+                if (getVal('consentimiento.nombre_firma')) {
+                    htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">Consentimiento / Autorización</h2>`;
+                    htmlContent += `<div style="text-align:justify; margin-bottom:6px;">El suscrito autoriza al médico o a los médicos encargados del cuidado del paciente a efectuar los exámenes, tratamientos e intervenciones que se consideren necesarios o aconsejables para el diagnóstico y tratamiento del caso.</div>`;
+                    htmlContent += `<div><strong>Firmado por:</strong> ${getVal('consentimiento.nombre_firma')} (C.I. ${getVal('consentimiento.cedula_firma') || '___'}) — Parentesco: ${getVal('consentimiento.parentesco') || 'Paciente'} — Fecha: ${getVal('consentimiento.fecha') || '___'}</div>`;
+                }
+
+                // 3. TEXTOS LIBRES
+                const addTextSection = (title, path) => {
+                    const val = getVal(path);
+                    if (val && val.trim() !== '') {
+                        htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">${title}</h2>`;
+                        htmlContent += `<div style="text-align: justify; margin-bottom: 10px; white-space: pre-wrap;">${val}</div>`;
+                    }
+                };
+
+                addTextSection('Información Adicional', 'id.info_adicional');
+                addTextSection('Motivo de Ingreso', 'motivo.texto');
+                addTextSection('Enfermedad Actual', 'enfermedad_actual.texto');
+                addTextSection('Diagnóstico Provisional / de Admisión', 'diagnostico.provisional');
+
+                // 4. NIEGA/REFIERE FORMATO NARRATIVO
+                const buildNiegaRefiereHtml = (title, items, basePath, groupByFamiliar = false) => {
+                    let narrative = "";
+                    let refers = [];
+                    let denies = [];
+
+                    if (groupByFamiliar) {
+                        const grupos = {};
+                        const addAGrupo = (familiarRaw, texto) => {
+                            const familiar = familiarRaw || 'un familiar no especificado';
+                            if (!grupos[familiar]) grupos[familiar] = [];
+                            grupos[familiar].push(texto);
+                        };
+                        items.forEach(item => {
+                            const status = getVal(`${basePath}.${item.id}.status`);
+                            const detalle = getVal(`${basePath}.${item.id}.detalle`);
+                            const familiar = getVal(`${basePath}.${item.id}.familiar`);
+                            if (status === 'refiere') {
+                                addAGrupo(familiar, detalle ? `${item.label} (${detalle})` : item.label);
+                            } else if (status === 'niega') {
+                                denies.push(item.label);
+                            }
+                        });
+                        let otrosLista = getNestedValue(formData, `${basePath}.otros_lista`, []);
+                        if (!Array.isArray(otrosLista)) otrosLista = [];
+                        otrosLista.forEach(o => {
+                            if (o && o.texto) addAGrupo(o.familiar, o.texto);
+                        });
+
+                        const famKeys = Object.keys(grupos);
+                        if (famKeys.length === 0 && denies.length === 0) return;
+
+                        if (famKeys.length > 0) {
+                            const frasesFam = famKeys.map(fam => {
+                                const enfe = grupos[fam];
+                                const ultima = enfe.pop();
+                                const textoEnfe = enfe.length > 0 ? enfe.join(', ') + ' y ' + ultima : ultima;
+                                return `su ${fam} padece de ${textoEnfe}`;
+                            });
+                            const ultimaFrase = frasesFam.pop();
+                            const textoFam = frasesFam.length > 0 ? frasesFam.join(', ') + ' y ' + ultimaFrase : ultimaFrase;
+                            narrative += `El paciente refiere que ${textoFam}. `;
+                        }
+
+                        if (denies.length > 0) {
+                            const ultima = denies.pop();
+                            const textoDenies = denies.length > 0 ? denies.join(', ') + ' y ' + ultima : ultima;
+                            narrative += `Por otro lado, niega la presencia de antecedentes familiares correspondientes a ${textoDenies}. `;
+                        }
+                    } else {
+                        items.forEach(item => {
+                            const status = getVal(`${basePath}.${item.id}.status`);
+                            const detalle = getVal(`${basePath}.${item.id}.detalle`);
+                            if (status === 'refiere') {
+                                refers.push(detalle ? `${item.label} (${detalle})` : item.label);
+                            } else if (status === 'niega') {
+                                denies.push(item.label);
+                            }
+                        });
+                        const otrosTexto = getVal(`${basePath}.otros_texto`);
+
+                        if (refers.length === 0 && denies.length === 0 && !otrosTexto) return;
+
+                        if (refers.length > 0) {
+                            const ultima = refers.pop();
+                            const textoRefers = refers.length > 0 ? refers.join(', ') + ' y ' + ultima : ultima;
+                            narrative += `El paciente refiere antecedente de ${textoRefers}. `;
+                        } else if (denies.length > 0 || otrosTexto) {
+                            narrative += `El paciente no refiere antecedentes o complicaciones patológicas particulares en esta área. `;
+                        }
+
+                        if (denies.length > 0) {
+                            const ultima = denies.pop();
+                            const textoDenies = denies.length > 0 ? denies.join(', ') + ' y ' + ultima : ultima;
+                            narrative += `Niega tener o haber tenido ${textoDenies}. `;
+                        }
+
+                        if (otrosTexto) {
+                            narrative += `Adicionalmente, reporta: ${otrosTexto}.`;
+                        }
+                    }
+
+                    if (narrative.trim() === '') return;
+                    htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">${title}</h2>`;
+                    htmlContent += `<div style="text-align: justify; margin-bottom: 10px; line-height: 1.5;">${narrative.trim()}</div>`;
+                };
+
+                buildNiegaRefiereHtml('Antecedentes Personales Patológicos', ANTECEDENTES_PATOLOGICOS, 'antecedentes_patologicos');
+                buildNiegaRefiereHtml('Antecedentes Quirúrgicos / Traumáticos / Transfusionales', ANTECEDENTES_QUIRURGICOS, 'antecedentes_quirurgicos');
+
+                addTextSection('Medicamentos de Uso Actual', 'antecedentes_farmacologicos.medicamentos_actuales');
+                addTextSection('Alergias Medicamentosas Conocidas', 'antecedentes_farmacologicos.alergias_medicamentosas');
+
+                // Gineco-obstétricos y Desarrollo psicomotor
+                const addStructuredSection = (title, config, basePath) => {
+                    const values = getNestedValue(formData, basePath, {});
+                    const composed = config.compose(values);
+                    const notas = getVal(`${basePath}.notas`);
+                    if (!composed && !notas) return;
+                    htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">${title}</h2>`;
+                    if (composed) htmlContent += `<div style="margin-bottom:4px; text-align: justify; line-height: 1.5;">${composed}</div>`;
+                    if (notas) htmlContent += `<div style="color:#4b5563; font-style: italic; text-align: justify; line-height: 1.5;">${notas}</div>`;
+                };
+
+                addStructuredSection('Composición Familiar y Estado de Salud', FAMILIA_DIRECTA_CONFIG, 'familia_directa');
+                buildNiegaRefiereHtml('Antecedentes Familiares Patológicos (enfermedades específicas)', ANTECEDENTES_FAMILIARES, 'antecedentes_familiares', true);
+
+                addStructuredSection('Esquema de Vacunación', VACUNACION_CONFIG, 'vacunacion');
+                addStructuredSection('Antecedentes Gineco-Obstétricos', GINECO_CONFIG, 'gineco');
+                addStructuredSection('Antecedentes Prenatales y Obstétricos (del paciente)', PRENATAL_PACIENTE_CONFIG, 'prenatal_paciente');
+                addStructuredSection('Periodo Neonatal', PERIODO_NEONATAL_CONFIG, 'periodo_neonatal');
+                addStructuredSection('Alimentación Infantil', ALIMENTACION_INFANTIL_CONFIG, 'alimentacion_infantil');
+                addStructuredSection('Desarrollo Psicomotor', DESARROLLO_CONFIG, 'desarrollo');
+
+                // Hábitos psicobiológicos
+                let habitosHtml = '';
+                Object.keys(HABITOS_CONFIG).forEach(key => {
+                    const cfg = HABITOS_CONFIG[key];
+                    const values = getNestedValue(formData, `habitos.${key}`, {});
+                    const composed = cfg.compose(values);
+                    const notas = values.notas;
+                    if (composed || notas) {
+                        habitosHtml += `<li style="margin-bottom:4px; line-height: 1.5;"><strong style="color:#374151;">${cfg.title}:</strong> ${composed || ''}${notas ? ` <em style="color:#6b7280;">(${notas})</em>` : ''}</li>`;
+                    }
+                });
+                if (habitosHtml) {
+                    htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">Hábitos Psicobiológicos</h2>`;
+                    htmlContent += `<ul style="margin:0; padding-left:16px;">${habitosHtml}</ul>`;
+                }
+
+                addStructuredSection('Antecedentes Epidemiológicos y Socioambientales', EPIDEMIOLOGICOS_CONFIG, 'epidemiologicos');
+
+                // 5. GENERADOR DE SISTEMAS FORMATO NARRATIVO
+                const buildSystemsHtml = (title, templateObj, statePath) => {
+                    let sectionHtml = '';
+                    let hasContent = false;
+
+                    Object.keys(templateObj).forEach(groupKey => {
+                        let groupNarrative = [];
+                        let hasIssues = false;
+                        
+                        templateObj[groupKey].forEach(item => {
+                            const status = getVal(`${statePath}.${groupKey}.${item.id}.status`, 'omit');
+                            const text = getVal(`${statePath}.${groupKey}.${item.id}.text`, '');
+
+                            if (status !== 'omit' && text.trim() !== '') {
+                                groupNarrative.push(`${item.label.toLowerCase()} (${text})`);
+                                if (status === 'pathological') hasIssues = true;
+                            }
+                        });
+
+                        const otrosHallazgos = getVal(`${statePath}.${groupKey}.otros_hallazgos`);
+                        if (otrosHallazgos) {
+                            groupNarrative.push(`otros hallazgos asociados: ${otrosHallazgos}`);
+                            hasIssues = true;
+                        }
+
+                        if (groupNarrative.length > 0) {
+                            hasContent = true;
+                            const groupName = groupKey.replace(/_/g, ' ').toUpperCase();
+                            
+                            let narrativeText = "";
+                            const ultima = groupNarrative.pop();
+                            const textoItems = groupNarrative.length > 0 ? groupNarrative.join(', ') + ' y ' + ultima : ultima;
+
+                            if (hasIssues) {
+                                narrativeText = `A nivel de ${groupName.toLowerCase()}, se evidencian alteraciones o descripciones patológicas consistentes en ${textoItems}.`;
+                            } else {
+                                narrativeText = `El interrogatorio / examen de ${groupName.toLowerCase()} muestra normalidad o descripción clínica de ${textoItems}.`;
+                            }
+
+                            sectionHtml += `<div style="margin-bottom: 6px; text-align: justify; line-height: 1.5;">
+                                <strong style="color: #1f2937;">${groupName}:</strong> ${narrativeText}
+                            </div>`;
+                        }
+                    });
+
+                    if (hasContent) {
+                        htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 8px; padding-bottom: 2px; text-transform: uppercase;">${title}</h2>`;
+                        htmlContent += sectionHtml;
+                    }
+                };
+
+                buildSystemsHtml('Examen Funcional', EXAMEN_FUNCIONAL_TEMPLATE, 'examen_funcional');
+
+                // 6. SIGNOS VITALES
+                let vitalsHtml = '';
+                const vitals = [
+                    {label: 'TA', path: 'vitales.ta', unit: 'mmHg'}, {label: 'FC', path: 'vitales.fc', unit: 'lpm'},
+                    {label: 'FR', path: 'vitales.fr', unit: 'rpm'}, {label: 'Temp', path: 'vitales.temp', unit: '°C'},
+                    {label: 'SatO2', path: 'vitales.sat', unit: '%'}, {label: 'Peso', path: 'vitales.peso', unit: 'kg'},
+                    {label: 'Talla', path: 'vitales.talla', unit: 'cm'}, {label: 'IMC', path: 'vitales.imc', unit: ''},
+                    {label: 'Circunf. Cintura', path: 'vitales.cintura', unit: 'cm'}, {label: 'Circunf. Cadera', path: 'vitales.cadera', unit: 'cm'},
+                    {label: 'Índice Cintura/Cadera', path: 'vitales.icc', unit: ''}, {label: 'Perímetro Cefálico', path: 'vitales.perimetro_cefalico', unit: 'cm'},
+                    {label: 'Glicemia capilar', path: 'vitales.glicemia', unit: 'mg/dL'}, {label: 'Escala de dolor', path: 'vitales.dolor', unit: '/10'}
+                ];
+
+                vitals.forEach(v => {
+                    const val = getVal(v.path);
+                    if(val) vitalsHtml += `<span style="border: 1px solid #e4f2d6; padding: 2px 6px; margin-right: 6px; margin-bottom: 6px; display: inline-block;"><strong>${v.label}:</strong> ${val} ${v.unit}</span> `;
+                });
+
+                if (vitalsHtml) {
+                     htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 8px; padding-bottom: 2px; text-transform: uppercase;">Signos Vitales y Antropometría</h2>`;
+                     htmlContent += `<div style="line-height: 2;">${vitalsHtml}</div>`;
+                }
+
+                buildSystemsHtml('Examen Físico', EXAMEN_FISICO_TEMPLATE, 'examen_fisico');
+
+                addTextSection('Impresión Diagnóstica (tras antecedentes y examen físico)', 'diagnostico.impresion');
+                addTextSection('Plan / Órdenes Médicas', 'diagnostico.plan');
+
+                // 7. EVOLUCIÓN
+                const evolRows = getNestedValue(formData, 'evolucion.notas', []);
+                if (Array.isArray(evolRows) && evolRows.some(r => r.nota && r.nota.trim())) {
+                    htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">Notas de Evolución</h2>`;
+                    htmlContent += `<table style="width:100%; border-collapse: collapse; margin-bottom: 10px;"><tr><td style="border:1px solid #e5e7eb; padding:4px; font-weight:bold; width:15%;">Fecha</td><td style="border:1px solid #e5e7eb; padding:4px; font-weight:bold; width:10%;">Hora</td><td style="border:1px solid #e5e7eb; padding:4px; font-weight:bold;">Nota</td></tr>`;
+                    evolRows.forEach(r => {
+                        if (r.nota && r.nota.trim()) {
+                            htmlContent += `<tr><td style="border:1px solid #e5e7eb; padding:4px;">${r.fecha || ''}</td><td style="border:1px solid #e5e7eb; padding:4px;">${r.hora || ''}</td><td style="border:1px solid #e5e7eb; padding:4px;">${r.nota}</td></tr>`;
+                        }
+                    });
+                    htmlContent += `</table>`;
+                }
+
+                // 8. EGRESO
+                const egresoVal = getVal('egreso.tipo');
+                if (egresoVal || getVal('egreso.diagnostico_final')) {
+                    htmlContent += `<h2 style="font-size: 12px; font-weight: bold; color: #567d25; border-bottom: 1px solid #e5e7eb; margin-top: 12px; margin-bottom: 5px; padding-bottom: 2px; text-transform: uppercase;">Egreso</h2>`;
+                    htmlContent += `<div style="margin-bottom:4px;">`;
+                    if (egresoVal) htmlContent += `<strong>Tipo de egreso:</strong> ${egresoVal}. `;
+                    if (getVal('egreso.fecha')) htmlContent += `<strong>Fecha:</strong> ${getVal('egreso.fecha')} ${getVal('egreso.hora') || ''}. `;
+                    htmlContent += `</div>`;
+                    if (getVal('egreso.diagnostico_final')) htmlContent += `<div><strong>Diagnóstico Clínico Final:</strong> ${getVal('egreso.diagnostico_final')}</div>`;
+                    if (getVal('egreso.autopsia')) htmlContent += `<div style="margin-top:4px;"><strong>Autopsia solicitada:</strong> ${getVal('egreso.autopsia')}</div>`;
+                    if (getVal('egreso.exoneracion_nombre')) {
+                        htmlContent += `<div style="margin-top:8px; padding:8px; border:1px solid #fbbf24; border-radius:6px;">
+                            <strong style="color:#92400e;">Exoneración de Responsabilidad por Egreso:</strong>
+                            Firmado por ${getVal('egreso.exoneracion_nombre')} (C.I. ${getVal('egreso.exoneracion_cedula') || '___'}) — Parentesco: ${getVal('egreso.exoneracion_parentesco') || '___'} — Fecha: ${getVal('egreso.exoneracion_fecha') || '___'}
+                        </div>`;
+                    }
+                }
+
+                htmlContent += `</div>`;
+
+                // Construcción de documento Word (.doc compatible usando MIME HTML)
+                const docHeader = "<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'><title>Historia Clinica</title></head><body>";
+                const docFooter = "</body></html>";
+                const sourceHTML = docHeader + htmlContent + docFooter;
+                
+                const blob = new Blob(['\ufeff', sourceHTML], { type: 'application/msword' });
+                const url = URL.createObjectURL(blob);
+                const fileDownload = document.createElement("a");
+                document.body.appendChild(fileDownload);
+                fileDownload.href = url;
+                fileDownload.download = `Historia_Clinica_${getVal('id.apellidos', 'Paciente')}_${getVal('id.nombres', '')}.doc`;
+                fileDownload.click();
+                document.body.removeChild(fileDownload);
+                URL.revokeObjectURL(url);
+            };
+
+
+            if (!isLoaded) return <div className="flex h-screen items-center justify-center text-clinical-600 font-medium">Cargando Historia Clínica...</div>;
+
+            const progressPercentage = ((currentStep + 1) / SECTIONS.length) * 100;
+
+            return (
+                <>
+                {view === 'list' ? (
+                    <RecordsListView records={recordIndex} onOpen={openRecord} onNew={startNewRecord} onDelete={requestDeleteRecord} isOnline={isOnline} />
+                ) : (
+                <div className="min-h-screen flex flex-col bg-slate-100">
+                    <header className="bg-clinical-900/90 backdrop-blur-xl text-white shadow-[0_4px_30px_rgba(0,0,0,0.08)] sticky top-0 z-20 border-b border-clinical-800">
+                        <div className="max-w-4xl mx-auto px-4 py-3 flex justify-between items-center gap-3">
+                            <div className="flex items-center gap-1 sm:gap-3 min-w-0">
+                                <button onClick={backToList} className="p-2 hover:bg-white/10 rounded-full transition-colors flex-shrink-0" title="Volver a Mis Historias">
+                                    <svg className="w-5 h-5 sm:w-6 sm:h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10 19l-7-7m0 0l7-7m-7 7h18"></path></svg>
+                                </button>
+                                <div className="flex flex-col min-w-0">
+                                    <h1 className="text-lg sm:text-2xl font-extrabold tracking-tight leading-tight truncate">Historia Clínica</h1>
+                                    <span className="text-[10px] sm:text-xs font-semibold text-clinical-200 opacity-90 mt-0.5 tracking-wider uppercase truncate">
+                                        por Luis A. Medina Franco
+                                    </span>
+                                </div>
+                            </div>
+                            <div className="flex gap-2">
+                                <button onClick={requestClearCurrent} className="px-3 sm:px-4 py-2 bg-white/10 hover:bg-red-500 rounded-full transition-all flex items-center text-sm font-bold ring-1 ring-white/20" title="Vaciar esta historia">
+                                    <svg className="w-4 h-4 mr-0 sm:mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+                                    <span className="hidden sm:inline">Limpiar</span>
+                                </button>
+                                <button onClick={exportWordDocument} className="px-4 sm:px-5 py-2 bg-white text-clinical-900 hover:bg-clinical-50 rounded-full shadow-[0_2px_10px_rgba(0,0,0,0.1)] transition-all flex items-center text-sm font-bold" title="Exportar a Word (editable)">
+                                    <svg className="w-4 h-4 mr-0 sm:mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                    <span className="hidden sm:inline">Word</span>
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="max-w-4xl mx-auto px-4 pb-0 overflow-x-auto tab-scrollbar flex gap-4 mt-2">
+                            {SECTIONS.map((section, index) => (
+                                <button
+                                    key={index}
+                                    onClick={() => changeStep(index)}
+                                    className={`whitespace-nowrap px-2 py-3 text-sm font-bold border-b-2 transition-all duration-200 ${currentStep === index ? 'border-white text-white' : 'border-transparent text-clinical-200/80 hover:text-white'}`}
+                                >
+                                    {section}
+                                </button>
+                            ))}
+                        </div>
+                        <div className="h-0.5 bg-clinical-900/50 w-full mt-[1px]">
+                            <div className="h-0.5 bg-clinical-400 transition-all duration-500 ease-out shadow-[0_0_8px_rgba(255,255,255,0.5)]" style={{ width: `${progressPercentage}%` }}></div>
+                        </div>
+                    </header>
+
+                    <main className="flex-1 max-w-4xl w-full mx-auto p-4 sm:p-6 pb-24">
+                        <div className="bg-white/80 backdrop-blur-xl rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.04)] border border-white p-5 sm:p-7 mb-6 min-h-[50vh] p-5 sm:p-7 mb-6 min-h-[50vh]">
+                            <h2 className="text-xl font-extrabold text-gray-800 mb-6 pb-3 border-b-2 border-clinical-200 uppercase tracking-wider flex items-center gap-3">
+                                <span className="w-1 h-6 bg-gradient-to-b from-clinical-500 to-clinical-700 rounded-full"></span>
+                                {SECTIONS[currentStep]}
+                            </h2>
+
+                            <div className="animate-fade-in">
+                                {currentStep === 0 && (
+                                    <div className="space-y-4">
+                                        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                                            <InputText label="Historia No." path="id.numero" value={getVal('id.numero')} onChange={handleUpdate} />
+                                            <InputText label="F. Ingreso" type="date" path="id.fecha" value={getVal('id.fecha')} onChange={handleUpdate} />
+                                            <InputText label="Hora de Ingreso" type="time" path="id.hora_ingreso" value={getVal('id.hora_ingreso')} onChange={handleUpdate} />
+                                            <SelectInput label="Tipo de Ingreso" path="id.tipo_ingreso" options={['Consulta', 'Emergencia', 'Referido']} value={getVal('id.tipo_ingreso')} onChange={handleUpdate} />
+                                            <InputText label="Servicio" path="id.servicio" value={getVal('id.servicio')} onChange={handleUpdate} />
+                                        </div>
+                                        <InputText label="Sala / Cuarto / Cama" path="id.sala" value={getVal('id.sala')} onChange={handleUpdate} />
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <InputText label="Apellidos" path="id.apellidos" value={getVal('id.apellidos')} onChange={handleUpdate} />
+                                            <InputText label="Nombres" path="id.nombres" value={getVal('id.nombres')} onChange={handleUpdate} />
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                                            <InputText label="Cédula" path="id.cedula" value={getVal('id.cedula')} onChange={handleUpdate} />
+                                            <InputText label="Fecha de Nacimiento" type="date" path="id.fecha_nacimiento" value={getVal('id.fecha_nacimiento')} onChange={handleUpdate} />
+                                            <InputText label="Hora de Nacimiento" type="time" path="id.hora_nacimiento" value={getVal('id.hora_nacimiento')} onChange={handleUpdate} />
+                                            <InputText label="Edad" type="number" path="id.edad" value={getVal('id.edad')} onChange={handleUpdate} />
+                                            <SelectInput label="Sexo" path="id.sexo" options={['Femenino', 'Masculino']} value={getVal('id.sexo')} onChange={handleUpdate} />
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                                            <SelectInput label="Estado Civil" path="id.estado_civil" options={['Soltero(a)', 'Casado(a)', 'Unión estable', 'Divorciado(a)', 'Viudo(a)']} value={getVal('id.estado_civil')} onChange={handleUpdate} />
+                                            <InputText label="Ocupación" path="id.ocupacion" value={getVal('id.ocupacion')} onChange={handleUpdate} />
+                                            <InputText label="Lugar de Nacimiento" path="id.lugar_nacimiento" value={getVal('id.lugar_nacimiento')} onChange={handleUpdate} />
+                                            <InputText label="Edad en horas/días (si es RN)" path="id.edad_neonatal" placeholder="Ej. 18 horas" value={getVal('id.edad_neonatal')} onChange={handleUpdate} />
+                                        </div>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            <InputText label="Religión" path="id.religion" value={getVal('id.religion')} onChange={handleUpdate} />
+                                            <InputText label="Seguro / SSO" path="id.seguro" value={getVal('id.seguro')} onChange={handleUpdate} />
+                                        </div>
+                                        <InputText label="Dirección Completa" path="id.direccion" value={getVal('id.direccion')} onChange={handleUpdate} />
+                                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                            <InputText label="Teléfono" path="id.telefono" value={getVal('id.telefono')} onChange={handleUpdate} />
+                                            <InputText label="Email" path="id.email" type="email" value={getVal('id.email')} onChange={handleUpdate} />
+                                            <InputText label="Fecha Admisión Anterior" type="date" path="id.admision_anterior" value={getVal('id.admision_anterior')} onChange={handleUpdate} />
+                                        </div>
+                                        <div className="bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100 p-5 rounded-xl border border-gray-200 mt-6 shadow-sm">
+                                            <h4 className="font-bold text-clinical-800 mb-4 border-b border-gray-200 pb-2">Médico que Elabora la Historia</h4>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <InputText label="Nombre del médico" path="id.medico_nombre" value={getVal('id.medico_nombre')} onChange={handleUpdate} />
+                                                <InputText label="N.º de Colegio / Cédula Profesional (M.P.P.S.)" path="id.medico_cedula" value={getVal('id.medico_cedula')} onChange={handleUpdate} />
+                                            </div>
+                                        </div>
+                                        <div className="bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-5 rounded-xl border border-clinical-200 mt-6 shadow-sm">
+                                            <h4 className="font-bold text-clinical-800 mb-4 border-b border-clinical-200 pb-2">Representante / Responsable (si el paciente es menor de edad)</h4>
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                                <InputText label="Nombre del padre/madre o responsable" path="id.representante_nombre" value={getVal('id.representante_nombre')} onChange={handleUpdate} />
+                                                <InputText label="Parentesco" path="id.representante_parentesco" value={getVal('id.representante_parentesco')} onChange={handleUpdate} />
+                                                <InputText label="Cédula" path="id.representante_cedula" value={getVal('id.representante_cedula')} onChange={handleUpdate} />
+                                            </div>
+                                        </div>
+                                        <div className="bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-5 rounded-xl border border-clinical-200 mt-6 shadow-sm">
+                                            <h4 className="font-bold text-clinical-800 mb-4 border-b border-clinical-200 pb-2">Contacto de Emergencia</h4>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <InputText label="Avisar a (Nombre)" path="id.emergencia_nombre" value={getVal('id.emergencia_nombre')} onChange={handleUpdate} />
+                                                <InputText label="Parentesco y Teléfono" path="id.emergencia_parentesco" value={getVal('id.emergencia_parentesco')} onChange={handleUpdate} />
+                                            </div>
+                                        </div>
+                                        <TextArea label="Información Adicional (a criterio del examinador)" path="id.info_adicional" rows={3} placeholder="Cualquier dato relevante de la identificación o el ingreso que no tenga un campo específico..." value={getVal('id.info_adicional')} onChange={handleUpdate} />
+                                    </div>
+                                )}
+
+                                {currentStep === 1 && (
+                                    <div className="space-y-6">
+                                        <TextArea label="Motivo de Ingreso (Síntoma Principal)" path="motivo.texto" rows={3} placeholder="Ej. Dificultad para respirar..." value={getVal('motivo.texto')} onChange={handleUpdate} />
+                                        <TextArea label="Enfermedad Actual" path="enfermedad_actual.texto" rows={12} placeholder="Relato conciso y completo de las dolencias, indicando fecha de comienzo, duración y tratamiento..." value={getVal('enfermedad_actual.texto')} onChange={handleUpdate} />
+                                        <TextArea label="Diagnóstico Provisional / de Admisión" path="diagnostico.provisional" rows={3} placeholder="Impresión diagnóstica inicial, antes de completar antecedentes y examen físico..." value={getVal('diagnostico.provisional')} onChange={handleUpdate} />
+                                    </div>
+                                )}
+
+                                {currentStep === 2 && (
+                                    <div>
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            Marca <strong>Niega</strong> o <strong>Refiere</strong> para cada antecedente. Si el paciente refiere, agrega el detalle en el campo de al lado.
+                                        </p>
+                                        <NiegaRefiereGroup title="Antecedentes Personales Patológicos" items={ANTECEDENTES_PATOLOGICOS} basePath="antecedentes_patologicos" formData={formData} onChange={handleUpdate} />
+                                        <NiegaRefiereGroup title="Antecedentes Quirúrgicos / Traumáticos / Transfusionales" items={ANTECEDENTES_QUIRURGICOS} basePath="antecedentes_quirurgicos" formData={formData} onChange={handleUpdate} />
+                                        <div className="mb-6 bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100 p-4 rounded-xl border border-gray-100">
+                                            <h3 className="text-base font-bold text-clinical-800 mb-3 flex items-center gap-2 border-b-2 border-clinical-200 pb-1.5">Antecedentes Farmacológicos</h3>
+                                            <TextArea label="Medicamentos de uso actual" path="antecedentes_farmacologicos.medicamentos_actuales" rows={3} value={getVal('antecedentes_farmacologicos.medicamentos_actuales')} onChange={handleUpdate} />
+                                            <InputText label="Alergias medicamentosas conocidas" path="antecedentes_farmacologicos.alergias_medicamentosas" value={getVal('antecedentes_farmacologicos.alergias_medicamentosas')} onChange={handleUpdate} />
+                                        </div>
+                                        <StructuredItem title="Esquema de Vacunación" config={VACUNACION_CONFIG} basePath="vacunacion" formData={formData} onChange={handleUpdate} />
+                                        <StructuredItem title="Antecedentes Gineco-Obstétricos (si aplica)" config={GINECO_CONFIG} basePath="gineco" formData={formData} onChange={handleUpdate} />
+                                        <StructuredItem title="Antecedentes Prenatales y Obstétricos (Pediatría, si aplica)" config={PRENATAL_PACIENTE_CONFIG} basePath="prenatal_paciente" formData={formData} onChange={handleUpdate} />
+                                        <StructuredItem title="Periodo Neonatal (Pediatría, si aplica)" config={PERIODO_NEONATAL_CONFIG} basePath="periodo_neonatal" formData={formData} onChange={handleUpdate} />
+                                        <StructuredItem title="Alimentación Infantil (Pediatría, si aplica)" config={ALIMENTACION_INFANTIL_CONFIG} basePath="alimentacion_infantil" formData={formData} onChange={handleUpdate} />
+                                        <StructuredItem title="Desarrollo Psicomotor (Pediatría, si aplica)" config={DESARROLLO_CONFIG} basePath="desarrollo" formData={formData} onChange={handleUpdate} />
+                                    </div>
+                                )}
+
+                                {currentStep === 3 && (
+                                    <div>
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            Estado de salud o causa de muerte de padres, hermanos, hijos y otros familiares directos.
+                                        </p>
+                                        <StructuredItem title="Composición Familiar y Estado de Salud" config={FAMILIA_DIRECTA_CONFIG} basePath="familia_directa" formData={formData} onChange={handleUpdate} />
+                                        <FamiliaresAdicionales formData={formData} onChange={handleUpdate} />
+                                        <NiegaRefiereGroup title="Antecedentes Familiares Patológicos (enfermedades específicas)" items={ANTECEDENTES_FAMILIARES} basePath="antecedentes_familiares" formData={formData} onChange={handleUpdate} familiares={getFamiliaresDisponibles(formData)} />
+                                    </div>
+                                )}
+
+                                {currentStep === 4 && (
+                                    <div>
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            Cada hábito tiene sus propios campos específicos. El texto clínico se genera automáticamente a partir de lo que llenes, y puedes agregar notas adicionales si hace falta.
+                                        </p>
+                                        {Object.keys(HABITOS_CONFIG).map(key => (
+                                            <StructuredItem key={key} title={HABITOS_CONFIG[key].title} config={HABITOS_CONFIG[key]} basePath={`habitos.${key}`} formData={formData} onChange={handleUpdate} />
+                                        ))}
+                                    </div>
+                                )}
+
+                                {currentStep === 5 && (
+                                    <div>
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            Vivienda, saneamiento, entorno y factores de riesgo epidemiológico.
+                                        </p>
+                                        <StructuredItem title="Antecedentes Epidemiológicos y Socioambientales" config={EPIDEMIOLOGICOS_CONFIG} basePath="epidemiologicos" formData={formData} onChange={handleUpdate} />
+                                    </div>
+                                )}
+
+                                {currentStep === 6 && (
+                                    <div>
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            <strong>Instrucciones:</strong> Deje en "Omitir" lo no evaluado. Use "Normal" para autocompletar. Al marcar <strong>"Patológico"</strong> se precargará el texto normal en <span className="text-gray-400 italic">gris claro</span> para que edite solo lo necesario.
+                                        </p>
+                                        {Object.keys(EXAMEN_FUNCIONAL_TEMPLATE).map(groupKey => (
+                                            <SystemGroup key={groupKey} title={groupKey} template={EXAMEN_FUNCIONAL_TEMPLATE[groupKey]} basePath={`examen_funcional.${groupKey}`} formData={formData} onChange={handleUpdate} />
+                                        ))}
+                                    </div>
+                                )}
+
+                                {currentStep === 7 && (
+                                    <div className="space-y-6">
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            El <strong>IMC</strong> y el <strong>índice cintura/cadera</strong> se calculan automáticamente al ingresar los valores correspondientes.
+                                        </p>
+                                        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-4">
+                                            <InputText label="T. Arterial (mmHg)" path="vitales.ta" placeholder="120/80" value={getVal('vitales.ta')} onChange={handleUpdate} />
+                                            <InputText label="F. Cardíaca (lpm)" path="vitales.fc" type="number" value={getVal('vitales.fc')} onChange={handleUpdate} />
+                                            <InputText label="F. Respiratoria (rpm)" path="vitales.fr" type="number" value={getVal('vitales.fr')} onChange={handleUpdate} />
+                                            <InputText label="Temperatura (°C)" path="vitales.temp" type="number" value={getVal('vitales.temp')} onChange={handleUpdate} />
+                                            <InputText label="Saturación O2 (%)" path="vitales.sat" type="number" value={getVal('vitales.sat')} onChange={handleUpdate} />
+                                            <InputText label="Peso (kg)" path="vitales.peso" type="number" value={getVal('vitales.peso')} onChange={handleUpdate} />
+                                            <InputText label="Talla (cm)" path="vitales.talla" type="number" value={getVal('vitales.talla')} onChange={handleUpdate} />
+                                            <InputText label="IMC (Auto)" path="vitales.imc" type="text" readOnly={true} value={getVal('vitales.imc')} />
+                                            <InputText label="Circunf. Cintura (cm)" path="vitales.cintura" type="number" value={getVal('vitales.cintura')} onChange={handleUpdate} />
+                                            <InputText label="Circunf. Cadera (cm)" path="vitales.cadera" type="number" value={getVal('vitales.cadera')} onChange={handleUpdate} />
+                                            <InputText label="Índice Cintura/Cadera (Auto)" path="vitales.icc" type="text" readOnly={true} value={getVal('vitales.icc')} />
+                                            <InputText label="Perímetro Cefálico (cm, Pediatría)" path="vitales.perimetro_cefalico" type="number" value={getVal('vitales.perimetro_cefalico')} onChange={handleUpdate} />
+                                            <InputText label="Glicemia capilar (mg/dL)" path="vitales.glicemia" type="number" value={getVal('vitales.glicemia')} onChange={handleUpdate} />
+                                            <InputText label="Escala de dolor (0-10)" path="vitales.dolor" type="number" value={getVal('vitales.dolor')} onChange={handleUpdate} />
+                                        </div>
+                                    </div>
+                                )}
+
+                                {currentStep === 8 && (
+                                    <div>
+                                        <p className="text-sm text-clinical-800 mb-6 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 p-4 rounded-xl border border-clinical-200">
+                                            Evaluación clínica segmentaria. La lógica de autocompletado es igual a la del examen funcional.
+                                        </p>
+                                        {Object.keys(EXAMEN_FISICO_TEMPLATE).map(groupKey => (
+                                            <SystemGroup key={groupKey} title={groupKey} template={EXAMEN_FISICO_TEMPLATE[groupKey]} basePath={`examen_fisico.${groupKey}`} formData={formData} onChange={handleUpdate} />
+                                        ))}
+                                    </div>
+                                )}
+
+                                {currentStep === 9 && (
+                                    <div className="space-y-6">
+                                        <TextArea label="Impresión Diagnóstica (tras antecedentes y examen físico)" path="diagnostico.impresion" rows={5} placeholder="1. ...&#10;2. ..." value={getVal('diagnostico.impresion')} onChange={handleUpdate} />
+                                        <TextArea label="Plan / Órdenes Médicas" path="diagnostico.plan" rows={8} value={getVal('diagnostico.plan')} onChange={handleUpdate} />
+                                    </div>
+                                )}
+
+                                {currentStep === 10 && (
+                                    <div className="space-y-6">
+                                        <EvolucionTable formData={formData} onChange={handleUpdate} />
+
+                                        <div className="bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100 p-4 rounded-xl border border-gray-100">
+                                            <h3 className="text-lg font-bold text-clinical-800 mb-4">Egreso</h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                                <SelectInput label="Tipo de egreso" path="egreso.tipo" options={['Curación', 'Mejoría', 'Traslado', 'Egreso contra opinión médica', 'Muerte', 'Otras causas']} value={getVal('egreso.tipo')} onChange={handleUpdate} />
+                                                <InputText label="Fecha de egreso" type="date" path="egreso.fecha" value={getVal('egreso.fecha')} onChange={handleUpdate} />
+                                                <InputText label="Hora de egreso" type="time" path="egreso.hora" value={getVal('egreso.hora')} onChange={handleUpdate} />
+                                            </div>
+                                            <TextArea label="Diagnóstico Clínico Final" path="egreso.diagnostico_final" rows={3} value={getVal('egreso.diagnostico_final')} onChange={handleUpdate} />
+                                            {getVal('egreso.tipo') === 'Muerte' && (
+                                                <div className="bg-white p-4 rounded-xl border border-gray-200 mt-2">
+                                                    <SelectInput label="¿Autopsia solicitada?" path="egreso.autopsia" options={['Sí', 'No']} value={getVal('egreso.autopsia')} onChange={handleUpdate} />
+                                                </div>
+                                            )}
+                                        </div>
+
+                                        {getVal('egreso.tipo') === 'Egreso contra opinión médica' && (
+                                            <div className="bg-amber-50 p-4 rounded-xl border border-amber-300">
+                                                <h3 className="text-lg font-bold text-amber-800 mb-2">Exoneración de Responsabilidad por Egreso</h3>
+                                                <p className="text-xs text-amber-700 mb-4">El suscrito certifica que la persona cuyo nombre aparece en esta historia sale del centro de salud contra la opinión de los médicos. Hace constar que, habiendo sido advertido de los riesgos que esto implica, descarga de toda responsabilidad a los médicos tratantes y a la institución por las consecuencias que de ello puedan resultar.</p>
+                                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                    <InputText label="Nombre de quien firma" path="egreso.exoneracion_nombre" value={getVal('egreso.exoneracion_nombre')} onChange={handleUpdate} />
+                                                    <InputText label="Cédula" path="egreso.exoneracion_cedula" value={getVal('egreso.exoneracion_cedula')} onChange={handleUpdate} />
+                                                    <SelectInput label="Parentesco" path="egreso.exoneracion_parentesco" options={['Paciente', 'Padre/Madre', 'Cónyuge', 'Hijo(a)', 'Otro familiar', 'Representante legal']} value={getVal('egreso.exoneracion_parentesco')} onChange={handleUpdate} />
+                                                    <InputText label="Fecha" type="date" path="egreso.exoneracion_fecha" value={getVal('egreso.exoneracion_fecha')} onChange={handleUpdate} />
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        <div className="bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100 p-4 rounded-xl border border-gray-100">
+                                            <h3 className="text-lg font-bold text-clinical-800 mb-2">Consentimiento / Autorización</h3>
+                                            <p className="text-xs text-gray-500 mb-4">El suscrito autoriza al médico o a los médicos encargados del cuidado del paciente a efectuar los exámenes, tratamientos e intervenciones que se consideren necesarios o aconsejables para el diagnóstico y tratamiento del caso.</p>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                                <InputText label="Nombre de quien firma" path="consentimiento.nombre_firma" value={getVal('consentimiento.nombre_firma')} onChange={handleUpdate} />
+                                                <InputText label="Cédula" path="consentimiento.cedula_firma" value={getVal('consentimiento.cedula_firma')} onChange={handleUpdate} />
+                                                <SelectInput label="Parentesco" path="consentimiento.parentesco" options={['Paciente', 'Padre/Madre', 'Cónyuge', 'Hijo(a)', 'Otro familiar', 'Representante legal']} value={getVal('consentimiento.parentesco')} onChange={handleUpdate} />
+                                                <InputText label="Fecha" type="date" path="consentimiento.fecha" value={getVal('consentimiento.fecha')} onChange={handleUpdate} />
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="flex justify-between items-center glass-nav p-4 rounded-2xl shadow-lg border border-gray-200/60 fixed bottom-4 left-4 right-4 md:static max-w-4xl mx-auto z-10">
+                            <button
+                                onClick={() => changeStep(Math.max(0, currentStep - 1))}
+                                disabled={currentStep === 0}
+                                className={`px-5 py-2.5 rounded-xl font-bold transition-all ${currentStep === 0 ? 'text-gray-300 bg-gradient-to-br from-slate-50 to-white shadow-sm ring-1 ring-slate-100 cursor-not-allowed' : 'text-clinical-700 bg-gradient-to-br from-blue-50/40 to-white shadow-sm ring-1 ring-blue-100/50 hover:bg-clinical-100 border border-clinical-200 hover:shadow-sm'}`}
+                            >
+                                ← Anterior
+                            </button>
+                            <span className="text-sm text-gray-500 font-bold bg-gray-100 px-4 py-1.5 rounded-full shadow-inner border border-gray-200">{currentStep + 1} / {SECTIONS.length}</span>
+                            {currentStep === SECTIONS.length - 1 ? (
+                                <button
+                                    onClick={exportWordDocument}
+                                    className="px-5 py-2.5 rounded-xl font-bold transition-all text-white bg-gradient-to-r from-clinical-600 to-clinical-700 hover:from-clinical-700 hover:to-clinical-800 shadow-md hover:shadow-lg hover:-translate-y-0.5 flex items-center gap-2"
+                                >
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                                    Descargar Word
+                                </button>
+                            ) : (
+                                <button
+                                    onClick={() => changeStep(Math.min(SECTIONS.length - 1, currentStep + 1))}
+                                    className="px-5 py-2.5 rounded-xl font-bold transition-all text-white bg-gradient-to-r from-clinical-500 to-clinical-600 hover:from-clinical-600 hover:to-clinical-700 shadow-md hover:shadow-lg hover:-translate-y-0.5"
+                                >
+                                    Siguiente →
+                                </button>
+                            )}
+                        </div>
+                    </main>
+                </div>
+                )}
+
+                {confirmAction && (
+                    <div className="fixed inset-0 bg-black/40 backdrop-blur-sm z-40 flex items-center justify-center p-4">
+                        <div className="bg-white rounded-2xl shadow-2xl max-w-sm w-full p-6 animate-slide-up ring-1 ring-gray-200/50">
+                            <h3 className="text-lg font-bold text-gray-800 mb-2">
+                                {confirmAction.type === 'clear' ? '¿Vaciar esta historia clínica?' : '¿Eliminar esta historia clínica?'}
+                            </h3>
+                            <p className="text-sm text-gray-600 mb-6 leading-relaxed">
+                                {confirmAction.type === 'clear'
+                                    ? 'Se borrarán todos los datos que has llenado en esta historia. Esta acción no se puede deshacer.'
+                                    : 'Esta historia se eliminará por completo de este dispositivo, incluyendo su fecha de ingreso y egreso si los tiene. Esta acción no se puede deshacer.'}
+                            </p>
+                            <div className="flex gap-3 justify-end">
+                                <button onClick={() => setConfirmAction(null)} className="px-4 py-2.5 rounded-xl text-gray-600 bg-gray-100 hover:bg-gray-200 font-semibold transition-colors">Cancelar</button>
+                                <button onClick={executeConfirm} className="px-4 py-2.5 rounded-xl text-white bg-red-600 hover:bg-red-700 font-semibold shadow-md hover:shadow-lg transition-all">
+                                    {confirmAction.type === 'clear' ? 'Sí, vaciar' : 'Sí, eliminar'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
+                </>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+<script>
+    if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+            navigator.serviceWorker.register('./service-worker.js')
+                .then(registration => {
+                    console.log('SW registrado exitosamente con scope: ', registration.scope);
+                })
+                .catch(err => {
+                    console.log('Fallo el registro del SW: ', err);
+                });
+        });
+    }
+</script>
+</body>
+</html>
